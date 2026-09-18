@@ -1,0 +1,988 @@
+# FILES.md
+
+The module map, one line per file, stating what it owns. Split out of
+[`CLAUDE.md`](CLAUDE.md), which is still the source of truth — it and the
+subsystem contracts under [`docs/`](docs/) that it points to carry the rules
+these modules obey; this file is for finding your way to the right one.
+
+server/               # The authoritative match server. Node, NullEngine, no
+  index.ts            #   rendering and no canvas — see server/README.md.
+                      #   Process entry: /health, /matches, the ws listener and
+                      #   the match registry — which IS the lobby, because
+                      #   matches live in this process. Routes a join (named,
+                      #   create, or wherever there is room), caps how many
+                      #   matches exist, and holds the pong deadline every
+                      #   socket in the process is swept against. Owns no
+                      #   game rules
+  Match.ts            #   One match: fixed-step loop, snapshots, the gates on
+                      #   what a client may claim, round rotation
+  Roster.ts           #   The 48 slots, 16 seats, team balance, human<->bot handover
+  MapVote.ts          #   The ballot for the next map: the candidates, the
+                      #   per-slot tally, the tie-break. Its first candidate is
+                      #   what the rotation would have picked, which is also
+                      #   what an empty ballot and a tie resolve to. Owns no
+                      #   transport and no timer
+  HeadlessGame.ts     #   The simulation: the server's answer to core/Game.ts,
+                      #   wired by the same rules. Owns the armour too — the
+                      #   fleet, the bot crews and the AT kit — plus `seat`,
+                      #   which is `Game.mount`/`clearVehicle` as one method
+  NetPlayer.ts        #   A connected human as the simulation sees one — the
+                      #   only position anything on the server trusts
+  world.ts            #   Rebuilds the solid world from the baked boxes: the
+                      #   collider half of MapBuilder and nothing else
+  lagComp.ts          #   Position history + the rewind around a shot. `resolve`
+                      #   takes a callback so the restore cannot be skipped
+  wire.ts             #   Is a client message shaped like what it claims to be?
+                      #   The one door a frame becomes a ClientMessage through,
+                      #   so no handler past it re-checks a field
+  validate.ts         #   Is a reported step physically possible? speed, ground,
+                      #   solid — and nothing else. `validateDrive` beside it is
+                      #   the same question for a HULL: the tank's speed bound,
+                      #   and neither of the other two (see its header)
+  simulate.ts         #   `npm run simulate`: a whole round, headless, no clients
+                      #   — and the instrument for the TICK, which is the only
+                      #   budget this process has. Times every step, files them
+                      #   by bots in contact, and names the spikes
+  parity.ts           #   Fingerprint dump for `npm run parity`
+```
+index.html          # The head, and NO interface CSS beyond the two things shown
+                    #   while there IS no interface: a black background (so a
+                    #   dev reload does not flash white) and the boot screen.
+main.ts             # Bootstrap. Imports src/ui/base.css FIRST. Awaits the two
+                    #   things the game cannot start without — the WebGPU device
+                    #   and the Havok WASM — then builds the Game, which takes
+                    #   both as arguments. Owns the boot screen: down on the
+                    #   first drawn frame, or one of the three failure messages.
+public/             # Copied to dist/ VERBATIM — unhashed URLs named by hand
+                    #   (manifest.webmanifest, icons/ from `npm run icons`).
+  profile_viewer.html # Where a frame-profiler capture is READ: paste or drop a
+                    #   KEEP/SAVE report or a TRACE and get the phase
+                    #   attribution, the heap and collector, and a verdict on
+                    #   every slow frame. Served from the game's own origin so
+                    #   the loop closes on the DEVICE that is slow. One file,
+                    #   no imports, no network, never typechecked — the sw.js
+                    #   arrangement. It is the SECOND navigable document, so
+                    #   its path is in sw.js's DOCS or it becomes the game
+                    #   offline. docs/profiling.md is the contract
+  regions.json      # Which match servers this deployment offers, by host. The
+                    #   one file a deployer edits on the box: adding, moving or
+                    #   draining a region is not a rebuild. no-cache in nginx
+                    #   and exempt in the service worker, for that reason.
+                    #   docker-compose.prod.yml bind-mounts the box's own copy
+                    #   over this one, which is what makes "on the box" true
+src/
+  config/           # ALL tunable constants (no magic numbers in code).
+                    #   One module per subsystem; import `CONFIG` from "…/config"
+    index.ts            # Composes CONFIG from the sections. The ONLY importer of
+                        #   them. A new tunable goes in a section, not here
+    fogWall.ts          # FOG_WALL alone — bots.ts reads it, so it cannot live in
+                        #   index.ts without an import cycle. The DEFAULT view
+                        #   distance now: a map's `fogEnd`, or its
+                        #   `bodyDrawDistance`, overrides it, and Game.installMap
+                        #   resolves ONE number into the three body gates
+    conquest.ts         # Flags, capture meter, tickets, bleed
+    score.ts            # What a kill, a bonus and a flag are worth on the
+                        #   board. Spent by both simulations, so a value here
+                        #   moves the offline round and the authority together
+    bots.ts             # Bot AI + the nav grid (bots, nav)
+    player.ts           # Movement, crouch, ground probe, vitals
+    weapons.ts          # The weapon table, the round, gunfeel (weapons, combat,
+                        #   gunfeel). `boltCycle` is the one field here that
+                        #   decides a GESTURE rather than a rule
+    recoil.ts           # What a shot does to the aim: the per-shot kick, the
+                        #   string's two envelopes, recovery, stance
+    sights.ts           # The optic table — its ORDER is the loadout row, and
+                        #   `eyeRelief` has to RISE with magnification or the
+                        #   camera's near plane clips the eyepiece open
+    viewmodel.ts        # Where the weapon sits in front of the camera
+    glass.ts            # Breakable glazing: the sweep's cap, the shard pool,
+                        #   the size band a piece is cut to and how far one is
+                        #   worth simulating
+    grenade.ts          # The throw, bounce, fuse and blast — including the
+                        #   eight layers the blast is DRAWN as, quoted for the
+                        #   grenade, which every other explosion scales off
+    equipment.ts        # The anti-tank slot: the launcher, the mines, and the
+                        #   bots' launcher band. Two numbers per item — what
+                        #   the HULL it struck takes, and the blast for
+                        #   everything else — because one falloff cannot serve
+                        #   a seven-metre vehicle and a one-metre body
+    camera.ts           # Look, FOV, view punch, shake
+    aimAssist.ts        # Controller aim assist and its three invariants
+    input.ts            # Deadzones, curves, haptics — pad and phone alike
+                        #   (input, rumble)
+    touch.ts            # The on-screen controls: the stick's shape, what a drag
+                        #   does to the aim, and how long a synthesized mouse
+                        #   event is disbelieved after a finger
+    audio.ts            # Levels, distances, rolloff for the synthesized mix
+    mix.ts              # The mixer, in two tiers that MULTIPLY: ten FAMILY
+                        #   faders (MixGroup) and 41 SOUND faders (MixChannel),
+                        #   every one 1 — a deviation, never a balance. Plus
+                        #   CHANNEL_GROUPS, which is why the two are not a tree:
+                        #   a weapon is ONE fader heard under both gun families.
+                        #   The one config file a tool rewrites (F4)
+    graphics.ts         # Render pipeline knobs + pooled effects (graphics,
+                        #   effects)
+    hud.ts              # Minimap and damage arcs (minimap, damageIndicator)
+    net.ts              # The wire's own numbers: the socket path, the
+                        #   interpolation delay and clock window, the reconnect
+                        #   backoff, the hit-credit window, the ping bands the
+                        #   lobby colours by, and the correction snap
+    profiling.ts        # The frame profiler's ring size, hitch threshold and
+                        #   probe depths. Nothing here decides anything about
+                        #   the game — FrameProfile is the only reader
+    lighting.ts         # The dynamic light budget (uniforms, not Babylon lights)
+    world.ts            # Map extents, occlusion, water, grass (map, ao, water,
+                        #   grass)
+    sky.ts              # The painted sky and moon shafts (sky, godRays)
+    wind.ts             # The one wind: a shared bearing, and what the grass
+                        #   field and the world's foliage each do with it
+    teams.ts            # The two sides; index 0 is the player's
+    vehicles.ts         # `VehicleSpec` — the SHAPE of one kind — plus the three
+                        #   kinds themselves: the TANK, the gun TRUCK and the
+                        #   HELICOPTER. Each states its hull, drive, suspension,
+                        #   guns, camera and engine voice; `gun: null` and
+                        #   `flight: null` are the two optional blocks, and are
+                        #   what `Vehicle.armed` and `Vehicle.flies` read.
+                        #   `climbHeight` decides what a vehicle drives
+                        #   over and what stops it (1.25 for the tank, 0.55 for
+                        #   the truck), and `resist` is where what each kind of
+                        #   damage is worth is written down — a rifle 0.05
+                        #   against armour and 0.45 against a soft skin, a
+                        #   blast 0.3/0.7, a shell 1 either way. The fleet-wide
+                        #   figures (the enter radius, the exit offset, the
+                        #   respawn and wreck clocks, the AI crew) sit above
+                        #   both
+  core/
+    Game.ts             # Orchestrator + main loop + all cross-system wiring.
+                        #   Constructor is construction only; wiring is
+                        #   wireSystems (+ four subject methods),
+                        #   installDomListeners, wireScreens; tick dispatches
+                        #   one method per screen. Holds ONE ScreenStack and
+                        #   never assigns a state — go/raiseLid/lowerLid, and
+                        #   takeDown for what a screen means on screen
+    ScreenStack.ts      # The state machine's shape as data: GameState, the
+                        #   SCREENS table (what a lid covers, what holds the
+                        #   world offline, what owes the netplay frame, what is
+                        #   owed the scoreboard), and the raised-lid stack. A
+                        #   new state does not compile without a row
+    InputManager.ts     # Keyboard/mouse + gamepad + TOUCH state, and rumble.
+                        #   Three sources, one composition, one set of fields —
+                        #   and the clock that says which device is in hand
+    CameraSystem.ts     # First-person cam at the eye; ADS zooms and slows by
+                        #   the fitted optic, at the weapon's own rate
+    Sfx.ts              # Procedural WebAudio, spatialised, voice-capped —
+                        #   plus SIXTEEN RECORDINGS: eight standing in for a
+                        #   report, six for a mechanism the player works with
+                        #   their own hands, and two for a blast, all a
+                        #   preference and never a requirement. Two kinds of
+                        #   SUSTAINED voice hang off the same rules and neither
+                        #   is ever recorded: an engine (buildEngine, two
+                        #   powerplants) and a place that makes a noise on its
+                        #   own (buildAmbience: a roar, a LIST of humps, a
+                        #   breath and one impulse-excited resonator per event
+                        #   row — nothing scheduled, THREE kinds and no branch,
+                        #   and each FITTED to a recording rather than tuned.
+                        #   A fire is one hump with the events carrying the
+                        #   top; water is two humps in the octaves the fire
+                        #   leaves empty, with the events a garnish.
+                        #   docs/audio.md has both tables).
+                        #   Owns the mixer's buses too: a dry tap into the
+                        #   master and a wet tap into the convolver, per family
+                        #   and again per (channel, family) PAIR, handed to
+                        #   every layer helper as its FIRST argument — so a
+                        #   fader reaches a sound's tail as well as its direct
+                        #   sound, and moves a voice already sounding
+    samples.ts          # The recorded sounds: an id union and a url table,
+                        #   nothing else. A weapon names a report row through
+                        #   ReportVoice.sample, and so do all three hulls'
+                        #   mg blocks; the reload's two, the bolt cycle's four
+                        #   and the two blasts are named by Sfx itself, since
+                        #   they belong to a moment, a beat or a blast rather
+                        #   than to any weapon. Every url here is the OUTPUT of
+                        #   `npm run audio`, and check-audio.mjs fails the build
+                        #   if this file and audio/manifest.json disagree
+    prefs.ts            # Remembered difficulty, map and loadout: the
+                        #   localStorage round trip only. Ids that index a table
+                        #   are validated, never trusted
+    settings.ts         # Settings shape, defaults, localStorage. Applies
+                        #   nothing — that is Game.applySettings, the ONLY
+                        #   place a setting reaches whatever owns it
+    teamView.ts         # Which side the player is LOOKING from: the one remap
+                        #   between the authority's team INDEX and the team a
+                        #   body is DRAWN and NAMED as, so every player sees
+                        #   their own side as amber Valeguard. PRESENTATION
+                        #   only — combat, conquest, the score and the wire
+                        #   never ask. Written by Game.buildRound BEFORE
+                        #   anything is built, because a kit is chosen when a
+                        #   rig is merged and cannot be repainted after
+    FrameProfile.ts     # Where a frame's milliseconds went, recorded
+                        #   CONTINUOUSLY into a ring and captured BACKWARDS —
+                        #   you feel the hitch, then press the button. SHIPS,
+                        #   armed by a setting or ?profile, and costs nothing
+                        #   at all while it is off. Allocates nothing while
+                        #   recording (GC is what it exists to catch). Game
+                        #   brackets the phases it already sequences; no system
+                        #   has heard of it. Handle: `window.__profile`
+    math.ts             # The scalar helpers more than one file needs: clamp,
+                        #   clamp01, hermite, smoothstep, angleDelta. Imports
+                        #   NOTHING, which is what makes it safe to import from
+                        #   anywhere — a leaf, not a path into core/. config/
+                        #   holds NUMBERS a designer tunes; this holds FUNCTIONS
+                        #   with none in them. `hermite` is the raw polynomial
+                        #   and `smoothstep` is the GLSL one that clamps — named
+                        #   apart rather than by a suffix, because `01` cannot
+                        #   mean an output range, an input clamp and a
+                        #   precondition at once. Nothing with a single caller
+                        #   belongs here
+    GlowDepth.ts        # Takes the GlowLayer's occlusion from the depth the
+                        #   FRAME has already written (shareDepth), so its
+                        #   render list is the emissive meshes and not the
+                        #   whole visible scene drawn black. ~20% of the frame
+                        #   on the big maps. FOUR mechanics and each fails
+                        #   SILENTLY on its own — read the header first
+  entities/
+    Player.ts           # Movement, sprint, crouch, jump, weapon state
+    ViewModel.ts        # The first-person weapon: carried gun + gloved arms on
+                        #   the camera, hip/ADS/sprint/reload/muzzle-load, sway,
+                        #   bob, and
+                        #   the kit turntable with the dark card behind it,
+                        #   fitted to the BAY the kit screen reports.
+                        #   Builds every weapon, enables one
+    weaponKit.ts        # The build accumulator every weapon model is written
+                        #   in + WeaponParts and WeaponSights (rail, or fixed),
+                        #   and the five colour groups a weapon merges into —
+                        #   which are also what a finish repaints
+    RifleModel.ts       # Low-poly SCAR-pattern battle rifle
+    CarbineModel.ts     # Low-poly FAMAS-pattern bullpup burst carbine —
+                        #   magazine behind the grip, carry-handle blade,
+                        #   full-hand trigger guard, folded bipod
+    SmgModel.ts         # Low-poly compact SMG — same contract
+    DmrModel.ts         # Low-poly semi-auto marksman rifle
+    SniperModel.ts      # Low-poly bolt-action sniper rifle — an action wrapped
+                        #   around the BORE rather than a receiver sitting on
+                        #   one, a skeletonised chassis stock, and the BOLT in a
+                        #   node of its own so the cycle can work it
+    LmgModel.ts         # Low-poly belt-fed light machine gun — feed cover and
+                        #   split rail, box under the receiver, the exposed
+                        #   brass belt, side-folded carry handle
+    PistolModel.ts      # 1911 sidearm — the one weapon that does not call
+                        #   optics.ts: no rail, so its notch and blade are its
+                        #   own and are all it ever wears
+    optics.ts           # Every optic assembly, built onto whichever weapon's
+                        #   OpticMount asked for them. Past ~4x the cone is
+                        #   bounded by the SCREEN rather than by the rail, which
+                        #   inverts how a new one is solved
+    weapons.ts          # WeaponId + WeaponSetup, + SIDEARM/PRIMARY_WEAPON_IDS
+    sights.ts           # SightId + magnification -> FOV, sensitivity, zoomComp
+    equipment.ts        # EquipmentId + the resolution of an AT item into an
+                        #   ordinary WeaponSetup (no fall-off, no spread, no
+                        #   reload, `magSize` IS a life's ammunition) and into
+                        #   the OrdnanceEffect a detonation is spent through
+    finishes.ts         # FinishId + the sixteen colour schemes, every one of
+                        #   them offered on every weapon, and the repaint over
+                        #   its colour groups. The one kit table that decides
+                        #   nothing
+    Combatant.ts        # Team + the shared shootable/shooter interface
+    Vehicle.ts          # ONE hull of any KIND: the collider (the only MOVING
+                        #   `solid` mesh in the game, and invisible to the nav
+                        #   graph for the reason a corpse is), the drive, the
+                        #   ten GROUND CONTACTS it stands on and the
+                        #   rate-limited climb that rides it over a car, the
+                        #   leading-end collision sphere, the turret's slew,
+                        #   BOTH guns' clocks and angles (the second seat's gun
+                        #   holds a WORLD bearing exactly as the turret does,
+                        #   which is what lets the two seats aim
+                        #   independently), which of its two SEATS are filled,
+                        #   the springs behind its lean, its SPRUNG body and
+                        #   its whips, `rideableAt` (the climb band spent on
+                        #   where the hull is ABOUT to be, which is the whole
+                        #   of an AI driver's road graph), and what a hull
+                        #   feels of each DamageKind. Takes a `VehicleSpec` and
+                        #   a rig BUILDER and knows no kinds; `armed` and
+                        #   `flies` are the only two questions anything asks
+                        #   about one. It also FLIES, on a hull that states a
+                        #   `flight` block — and `standOnGround` has never heard
+                        #   of that: what a rotor does to the ground model is
+                        #   `lift`, an addend that is 0 on anything else, so a
+                        #   hover is an equality and the plank is a landing
+                        #   floor. Knows nothing about a player
+    vehicleKinds.ts     # The list of kinds that exist, and the ONE place a
+                        #   kind becomes a name, a spec and a model. A map's
+                        #   `VehicleSpawnDef.kind` is resolved here, and the
+                        #   default (a tank) is written down once
+    vehicleRig.ts       # What every vehicle's MESH is: the joints `Vehicle`
+                        #   writes, the three extents the physics needs off the
+                        #   drawing (gauge, contact reach, wheel reach), and
+                        #   the three CLOSURES a model hands back — `setRun`,
+                        #   `reset`, `paint`. `setRun`'s FOURTH argument is the
+                        #   rotor, for the reason its third is the steer: a
+                        #   tracked hull's powerplant is already in the first
+                        #   two figures and a rotor is not. Plus `Box`/`Cyl`,
+                        #   the per-colour merge and the outline pass every
+                        #   model draws with. No geometry and no numbers
+    TankModel.ts        # ~180 boxes and cylinders merged to twenty-five, with
+                        #   a SPRUNG body over running gear that is not, a
+                        #   turret and a gun that turn, a CUPOLA gun on a ring
+                        #   that turns independently of both, two link strips
+                        #   and a toothed sprocket a side that RUN, two whip
+                        #   antennae that BOW, and the charred repaint a wreck
+                        #   takes.
+                        #   Art only — the extents that are RULES are CONFIG's
+    TruckModel.ts       # The gun truck: a CLOSED armoured 4x4 with a REMOTE
+                        #   weapon station on its roof (no pintle, no grips,
+                        #   nowhere to stand — there is no player model to put
+                        #   there), four wheels that TURN and two that STEER,
+                        #   one whip on the front wing, and the same charred
+                        #   repaint. Nothing may stand on the roof inside the
+                        #   station's sweep; the muzzle clears it by 5 cm at
+                        #   full depression.
+                        #   NO main gun — `VehicleRig.gun`/`muzzle` are null,
+                        #   which is what `Vehicle.armed` reads. Art only
+    HeliModel.ts        # The helicopter: a light gunship on skids with a main
+                        #   rotor, a tail rotor and a REMOTE door station on the
+                        #   port sill (the truck's rule — nothing may promise a
+                        #   body standing at it). `gun`/`muzzle` null and
+                        #   `turret` an INERT collar, exactly as the truck does
+                        #   it, so `aimMg` needs no branch. Both discs turn off
+                        #   `setRun`'s FOURTH argument, and the transmission's
+                        #   gear ratio lives here because it is a drawing
+                        #   decision. No tip-path ring: `inkRig` makes anything
+                        #   that thin nearly all ink, and a hoop round a parked
+                        #   aircraft reads as a cage. Art only
+    callsigns.ts        # What to call an AI on the scoreboard: roster index ->
+                        #   phonetic name, derived on both sides, never sent
+    Bot.ts              # Bot FSM (advance/hunt/engage/takeCover/suppressed/
+                        #   retreat/capture) + movement, aim, magazine, peek
+    BotMemory.ts        # One bot's decaying picture of the fight
+    SquadRadio.ts       # One TEAM's board: its squads' contact calls and the
+                        #   marks its own deaths leave. Cues, never targets
+    BotSkill.ts         # skill scalar -> BotProfile; difficulty tiers
+    SoldierModel.ts     # Merged bot rig + the per-team kit it is painted and
+                        #   shaped in + procedural animation (walk, aim, twist,
+                        #   crouch), and the RagdollSubject interface
+    NetSoldier.ts       # Somebody else, drawn from the wire: one rig, the
+                        #   interpolation buffer behind it, the gait its boots
+                        #   are heard off, no behaviour at all
+    GrenadeModel.ts     # What a grenade looks like — body, fuse pip, and the
+                        #   blink that reads the fuse. Built by the system that
+                        #   simulates them and by the one that only draws them
+    RpgModel.ts         # The launcher on the shoulder and the rocket that
+                        #   leaves it. Built from its VENTURI, not its middle,
+                        #   the one weapon with a `hipYaw` of its own, and the
+                        #   one whose loaded ROUND is a node that comes out
+    MineModel.ts        # The mine in the hands and the plate in the road. The
+                        #   one thing in the kit that is not a weapon at all
+  systems/
+    BattleSystem.ts     # Bot pool, AI scheduling, LOS, distance LOD
+    ConquestSystem.ts   # Flags, meters, tickets, bleed, spawns, planSquads
+    ScoreBook.ts        # The round's board: points, kills and deaths, one row
+                        #   per roster SLOT. A ledger, not a system — no update,
+                        #   reaches nothing. One per simulation (Game offline,
+                        #   HeadlessGame on the authority), and `awardKill` and
+                        #   `awardZone` are the one place each that a payout's
+                        #   shape is decided — both sides call the same two
+    CaptureZoneSystem.ts# Flags drawn in the world: ring, skirt, beacon
+    CombatSystem.ts     # Hitscan, fall-off, the head zone; pooled tracers, sparks, impacts
+    GrenadeSystem.ts    # The one thing that isn't hitscan, and six of the
+                        #   eight layers a blast is drawn as: the flash, the
+                        #   fireball's lobes, the shock ring, the embers, and
+                        #   BlastDust built TWICE — the low dust and the smoke
+                        #   column. `blastAt` is the one blast in the game and
+                        #   `drawBlast` the one place one is drawn
+    AntiTankSystem.ts   # The AT kit in the world: the rocket pool (the SECOND
+                        #   thing that isn't hitscan), the mine pool, the arm
+                        #   clocks and the hull trigger. Owns no blast and has
+                        #   never heard of a tank — it asks `hullNear` and
+                        #   announces `onDetonated`, and Game spends both
+    GlassSystem.ts      # Breakable panes: the segment sweep and the break —
+                        #   the visual, the collider, and the nav graph with
+                        #   the fields over it, all on the frame it happens.
+                        #   The one mutable thing in the world, monotonically
+                        #   so, and every CLEARED pane comes out of the list
+                        #   `openBox` re-severs against or a second break puts
+                        #   the first one's wall back
+    PhysicsWorld.ts     # The ONLY Havok in the game: the plugin, the map as
+                        #   one static body per 48 m block (a single compound is
+                        #   quadratic in its shapes), and the fixed-step clock.
+                        #   Owns no bodies — its three clients do. Exports
+                        #   loadHavok(), which main.ts awaits before there is a
+                        #   Game
+    RagdollSystem.ts    # Corpses under that engine. One refusal left (past the
+                        #   fog wall); a full pool evicts its oldest. Cannot
+                        #   tell a dead bot from the player's stand-in
+    DebrisSystem.ts     # Glass shards under it. A burst is CUT from the pane's
+                        #   own face along the cracks a round put in it; refuses
+                        #   past its own apparent-size gate, and evicts only a
+                        #   burst that has already landed
+    BlastDebrisSystem.ts# The two blast layers that outlive the fire, and the
+                        #   THIRD Havok client: the rubble a detonation throws —
+                        #   keyed on what it went off ON, so a crater turns up
+                        #   that map's own subsoil or pale stone — and the
+                        #   scorch it leaves, a decal that MULTIPLIES the ground
+                        #   rather than painting a colour onto it. A chunk's
+                        #   size and shape are decided at construction, so a
+                        #   burst never touches the WASM heap
+    glassFracture.ts    # The crack pattern itself: radials out of the hole,
+                        #   concentrics across them, clipped to the frame. Pure
+                        #   arithmetic — no Babylon, no state
+    puffTexture.ts      # The one puff in the game, drawn at runtime: three
+                        #   overlapping gradients, no image file. Shared by the
+                        #   blast's two clouds and the rotor's ring — what tells
+                        #   those apart is size, colour and count, never the
+                        #   sprite. Needs a canvas, so nothing on the server
+                        #   reaches it
+    RotorWash.ts        # What a helicopter does to the surface when it comes
+                        #   down: TWO standing GPU emitters per rotor on the
+                        #   field — dust and SPRAY — with `emitRate` driven off
+                        #   `Vehicle.washTo`, the disc's power against its skid
+                        #   clearance, and 0 for anything that does not fly.
+                        #   BlastDust's fountain twin: nothing is spawned,
+                        #   nothing is scheduled, and a machine that is high,
+                        #   dead or spooled down is one emitting at a rate of
+                        #   zero. WATER picks which ring runs rather than
+                        #   silencing both, and `washTo` is asked a SECOND time
+                        #   with the surface as its floor, because the skyline
+                        #   under a machine over a bay is the bed. It also
+                        #   publishes the wash SITES the water's own shader
+                        #   draws the hole and the rings from. A puff fades IN
+                        #   as well as out, which is a colour GRADIENT and is
+                        #   why a ring is coloured when it is BUILT — see
+                        #   `paint` for the before-the-first-render rule that
+                        #   makes that safe here and not in BlastDust, and for
+                        #   why the spray's pair is LIT on the way in and the
+                        #   dust's is not. Client only
+    DeathCam.ts         # The player's own death; the only occlusion pick
+                        #   outside combat
+    VehicleSystem.ts    # The armour on the field: one hull per hardstanding, the
+                        #   wreck clock and the respawn clock (two, so a side can
+                        #   never field both), which SEAT a boarder gets
+                        #   (`seatOn` — the driver's first, stated once for both
+                        #   processes), and where a dismount lands. Owns
+                        #   no player and no AI — `update` asks a `VehicleOrders`
+                        #   four questions per hull: who is at the sticks, who
+                        #   is on the cupola gun, and which of the two somebody
+                        #   ELSE is deciding. `Game`/`HeadlessGame` are
+                        #   the only things that can answer. A `predicted` fleet
+                        #   is a netplay client's: both clocks stand down
+    VehicleCamera.ts    # The view from twelve metres behind a hull: its own yaw
+                        #   and pitch, its occlusion pull-in, and the gun's kick.
+                        #   `DeathCam`'s shape — it produces an eye and a look
+                        #   and `Game` hands both to CameraSystem.place. `aim`
+                        #   and `place` straddle the world step on purpose
+    VehicleCrew.ts      # The bots that crew: which body is in which SEAT of
+                        #   which hull, and what it asks of the thing in its
+                        #   hands. TWO per hull — a driver and a gunner, two
+                        #   brains with two target sets, the gunner seeing
+                        #   INFANTRY only and firing in bursts because a
+                        #   machine gun cannot hurt armour. A crewed bot leaves
+                        #   `Bot`'s FSM entirely (`BattleSystem.aside`) and
+                        #   keeps its life, its position and its squad's order.
+                        #   Steers on the body flow field for a BEARING and on
+                        #   `Vehicle.rideableAt` for what is a wall; a PILOT is
+                        #   that sentence one axis up, on `Vehicle.aloftAt` for
+                        #   how high the air has to be flown, and answers an
+                        #   obstacle by climbing before it answers by turning.
+                        #   `evict` is what stops the AI holding a side's only
+                        #   armour
+    AimAssistSystem.ts  # Gamepad-only: outer bubble slows the stick, inner one
+                        #   rotates. Bounded by the player's own turn rate
+    LightingSystem.ts   # Dynamic point lights: fixtures, flashes, lamps
+    AmbienceSystem.ts   # Where the world makes a noise on its own: the emitter
+                        #   registry MapBuilder fills, and the nearest-first
+                        #   ranking that spends CONFIG.audio.ambience.maxVoices
+                        #   on it. LightingSystem's problem in a different
+                        #   currency. An emitter is a PLACE or a RUN of them
+                        #   scored on whichever is nearest — a fire is a point
+                        #   and a shore is a line — and its INDEX is the key
+                        #   Sfx holds a graph on, so add()/addRun() only append
+                        #   and clear() is the only thing that renumbers
+    ShadowSystem.ts     # Moon shadow map (stepped) + blob shadows
+    ReflectionSystem.ts # The world as glass sees it: one cube per GLAZED
+                        #   BLOCK, baked from the map's own geometry per
+                        #   install with whatever encloses the probe left out,
+                        #   and the box the shader parallax-corrects the
+                        #   mirrored ray against. The only render target here
+                        #   besides the shadow map. The bake is spent a budget
+                        #   of draws per FRAME, under the loading card, and
+                        #   each face draws only what that face can SEE
+    Atmosphere.ts       # Ash field on the GPU, simulated by a compute shader.
+                        #   No CPU fallback — WebGPU is a hard requirement and
+                        #   guarantees it
+    Sky.ts              # Generated dome, textured moon, fBm cloud decks
+    WorldCulling.ts     # How much of the map the frame's own mesh walk is
+                        #   offered. Replaces scene.getActiveMeshCandidates and
+                        #   writes NOTHING onto a mesh, which is what leaves
+                        #   every ray, the shadow map, every cube probe and
+                        #   moveWithCollisions unable to tell it ran. A collider
+                        #   is never a candidate, a mesh carrying metadata.block
+                        #   is one inside the map's fogEnd, everything else
+                        #   always is
+    WaterSystem.ts      # Water surfaces from map WaterRects; bakes their bed depth.
+                        #   `setWash` is the rotor sites, pushed from `tick` and
+                        #   not from the camera tail — see it for why
+    GrassSystem.ts      # Grass fields as one thin-instanced draw; tufts inside a
+                        #   collider are rejected at scatter time
+  dev/                  # Dev-only tools that are not the editor. Same rule:
+    mixer/              #   dynamically imported, never on the static graph
+      index.ts          #   The F4 audio mixer: a slider per family and per
+                        #     sound, live, over a round that carries on
+                        #     underneath. Owns the collapse state, the
+                        #     auditions, and mute/solo — which are per TIER,
+                        #     and the PANEL's rather than the file's
+      source.ts         #   Reads config/mix.ts off /__layout, patches the
+                        #     value lines inside each table's own block, posts
+                        #     it back. Refuses rather than writing partially
+      mixer.css         #   Imported by index.ts so it rides the same chunk
+  editor/               # Dev-only map editor (F2). Dynamically imported —
+    index.ts            #   never statically imported from anywhere, or it
+    EditorCamera.ts     #   lands in the production bundle
+    EditorPanel.ts
+    panel.css           #   Imported by EditorPanel so it rides the dynamic
+                        #   chunk. Never link it from HTML
+    workLight.ts        #   Brightened EnvironmentSpec for authoring
+    selection.ts        #   SelectionRef, predicate pick, highlight
+    proxies.ts          #   Stand-ins for flags/spawns/scatter/water/grass
+    gizmos.ts           #   Move + Y-rotate handles, snapping
+    mutate.ts           #   Layout writes: transform, fields, add/delete
+    fields.ts           #   FieldSpec + the key conventions inspect, the panel
+                        #   and mutate all have to agree on
+    inspect.ts/params.ts#   Inspector read model + per-kind param table
+    sourceScan.ts       #   layout.ts as text: regions, entries, tokens
+    validate.ts         #   Pre-save checks against the layout being emitted
+    navOverlay.ts       #   Draws the nav graph over the scene for authoring
+    terrainBrush.ts     #   Terrain mode: hover highlight + sculpt stroke
+    serialize.ts/save.ts#   Minimal-diff emit + POST to the dev server
+    saveEnvironment.ts  #   environment.ts patched one top-level KEY at a time
+                        #     — what the floor picker writes
+    tuning.ts           #   Tool constants (NOT src/config/ — not gameplay)
+  world/
+    layout.ts           # Placement/ScatterSpec/Heightfield/MapLayout — the
+                        #   map-data vocabulary, map-agnostic. The floor is
+                        #   NOT a field on MapLayout: see MapDef.heights
+    TerrainField.ts     # The floor's height and the ONLY place that knows it:
+                        #   heightAt() + per-block VertexData + terrainSlab(),
+                        #   and the BORDERLAND past the authored grid on a map
+                        #   whose boundary is open
+    Ridge.ts            # The valley rim, in two forms — an escarpment and the
+                        #   downs. Shape only: no collider, nothing inside the
+                        #   boundary it is handed
+    leash.ts            # What stops a player leaving a map that has no wall:
+                        #   one clock per body, and the verdict it reaches.
+                        #   Pure — the caller does the killing, and offline that
+                        #   is Game while in a match it is HeadlessGame
+    roads.ts            # The road network as rectangles, and the two questions
+                        #   they answer: is this ground PAVED, and where two
+                        #   cross, which one IS the ground (ROAD_RANK — dirt
+                        #   under cobble under asphalt, 2 mm apart). A
+                        #   road still stops no round and no body — what it
+                        #   rejects is something ROOTED sown on it, which is
+                        #   trees and scrub (PropBody.rooted) and every blade
+                        #   of grass
+    rng.ts              # mulberry32 — the seeded PRNG world-building uses
+    MapBuilder.ts       # Builds the map; merges visuals, emits colliders
+    solid.ts            # SOLID_ONLY — the one mesh pick predicate left, and the
+                        #   editor's alone. The three-way table of what a
+                        #   collider answers a body and a round is still here
+    RayWorld.ts         # The segment query every ray in the game asks, off the
+                        #   collider boxes, the strut groups and the terrain
+                        #   rather than off scene.meshes. castBody / castRound /
+                        #   blocked, the grid behind them, and the hulls, which
+                        #   are the one solid thing that moves. It is what
+                        #   retired scene.pickWithRay at all eight sites
+    CollisionField.ts   # RayWorld's counterpart for the one whole-scene walk a
+                        #   ray query could not replace: the collider MESHES
+                        #   bucketed, so moveWithCollisions is handed a street
+                        #   through Babylon's own surroundingMeshes instead of
+                        #   walking the map. `narrowedMove` is the whole of how
+                        #   a body sweeps — a hull's and the player's, the only
+                        #   two in the game, and it forces the mover's world
+                        #   matrix because the AUTHORITY never renders one.
+                        #   Superset or nothing — read it
+    vertexShading.ts    # The world's baked vertex-colour buffer, written after
+                        #   every merge: AO in the ALPHA, the world mark in the
+                        #   GREEN, the wind's sway weight in the RED
+    sway.ts             # Which foliage the wind moves and how much of it moves
+                        #   at a given height. Marks, layers, the weight ramp.
+                        #   A marked group leaves Babylon's outline pass and
+                        #   gets an ink twin (MapBuilder.inkTwin) instead
+    parts.ts            # A structure's PART meshes, built without ever reaching
+                        #   the GPU: uploading geometry that a merge throws away
+                        #   was half of a 1500 m build. partBox / partCylinder /
+                        #   partSurface, and uploadPart, which every path out of
+                        #   a merge owes. Colliders are NOT parts — a part has no
+                        #   submeshes and would stop nothing
+    BuildingKit.ts      # Facade: shared types + BUILDERS registry
+    kit/core.ts         #   Build accumulator (box/wall/guard/flight/...),
+                        #   palette, builder contract
+    kit/buildings.ts    #   cottage, townhouse, tavern, smithy, ruin,
+                        #   watchtower, chapel, barn, mill, boathouse,
+                        #   gatehouse, stiltHut, jungleRuin
+    kit/manor.ts        #   manor — the two-storey colonial house with the
+                        #   wrap-around gallery. Its own file: bigger than the
+                        #   rest of buildings.ts together
+    kit/structures.ts   #   silo, well, stall, fence, stoneWall, bridge,
+                        #   trestleBridge, templeRuin, haystack, lamp, cart,
+                        #   crates, woodpile, shed, trough, shrine, kiln
+    kit/terrain.ts      #   terrace, ramp, road, jetty, boardwalk, stairs
+    kit/harbour.ts      #   smelter, lighthouse, crane, fishRack, careenedHull,
+                        #   netLoft, saltPan — the volcanic-coast set, and the
+                        #   only one in the kit built for a map that already
+                        #   shipped. `smelter` is the tree's one LANDMARK: a
+                        #   hollow ore hall with an arch armour drives through,
+                        #   a furnace block carrying the light, a 40 m stack and
+                        #   a walked charging deck one flight up. Its header
+                        #   owns why a landmark has to be worth walking INTO,
+                        #   the three materials the whole set is made of, and
+                        #   why nothing else in it is climbable
+    kit/city.ts         #   tower, office, shophouse, depot, parkade, planter,
+                        #   barrier, car, streetLight, monument — the downtown
+                        #   set, and the first builders that stack WALKED floors.
+                        #   Its header owns the four rules that makes necessary,
+                        #   what each of the five buildings is FOR, and the
+                        #   collider budget an enterable one is spending
+    kit/desert.ts       #   adobeHouse, compoundWall, shellBlock, mosque,
+                        #   minaret, souk, windTower, caravanserai, hammam,
+                        #   granary, blastWall, sandbags, pylon — the desert-town
+                        #   set. `pylon` is the odd one: a power pole that
+                        #   carries the SPAN of wire ahead of it (`length`), so a
+                        #   chain of them draws one line across ground a
+                        #   placement cannot otherwise reach off the end of, and
+                        #   it samples `BuildCtx.terrain` for the far end's
+                        #   height. The first vernacular here whose ROOF is walked,
+                        #   which is what it exists for: a flat roof is a second
+                        #   storey of ground and a parapet is the cover on it.
+                        #   Its header owns the STAIR LANE every climbed building
+                        #   in it is built around, and the collider ORDER the
+                        #   nav grid's silent overflow makes load-bearing
+    NavGrid.ts          # Walkable-surface graph + precomputed flow fields
+    CoverMap.ts         # Baked per-surface directional cover masks
+    boxGeometry.ts      # Analytic WorldBox primitives, shared by NavGrid /
+                        #   ObstacleField / CoverMap
+    ObstacleField.ts    # Sub-cell collision push-out for thin props, and two
+                        #   bucketed queries over the same boxes: `groundAt`,
+                        #   what a track contact — and now a body's feet —
+                        #   stands on, and `wallAt`,
+                        #   its mirror — what is IN THE WAY, which is what an
+                        #   AI driver's whiskers ask
+    boxIndex.ts         # The build-time uniform grid over collider boxes, so
+                        #   scatter placement and the occlusion bake stop
+                        #   walking all of them
+    Props.ts            # Scatter props: trees, graves, rubble, braziers,
+                        #   boulders, brambles, barrels, and the understory —
+                        #   ferns, fallen buttress logs, carved stelae — plus
+                        #   the mid-story, the liana veil, which is NOT a
+                        #   scatter prop: the jungle tree hangs it off its own
+                        #   fronds, because scatter placement is what pushed it
+                        #   away from every crown on the map
+    textures.ts         # Generated canvas textures: the cobbles, and the floor
+                        #   surfaces — noise fields posterized onto a ramp of
+                        #   the map's floorColor, albedo and height in one pass
+    floorSurfaces.ts    # What the valley floor is MADE of: the surface roster
+                        #   and the ONE place a floor material is built
+    environment.ts      # EnvironmentSpec + applyEnvironment, and
+                        #   bodyDrawDistanceOf — the one reader of a map's body
+                        #   draw distance, capped at its own fogEnd
+    maps.ts             # MapDef + the MAPS registry. The only EXISTING file a
+                        #   new map has to touch (plus vite.config's WRITABLE).
+                        #   `MAPS` is an `import.meta.env.DEV` ternary and must
+                        #   stay one — that fold is what keeps the proving
+                        #   ground out of both bundles. Also loadHeights/
+                        #   heightsOf: a map's floor is a LAZY import and
+                        #   this is where it is asked for and remembered
+    buildProfile.ts     # Where the time behind the loading card went, per
+                        #   phase. DEV ONLY and a no-op otherwise; the handle
+                        #   is `window.__buildProfile()`
+    collision.ts        # MapCollision: the shape of a baked collider set, and
+                        #   the tuple->WorldBox expansion the server rebuilds
+                        #   from. Names no map; reached via MapDef.collision,
+                        #   which is a LAZY import so the client never ships it
+    fingerprint.ts      # A comparable summary of a built world — the nav graph,
+                        #   not the boxes. What `npm run parity` diffs
+    hollowmere/layout.ts      # A MAP — every placement, flag and spawn
+    hollowmere/heights.ts     # GENERATED floor heights (editor terrain mode).
+                              #   Reached via MapDef.heights, a LAZY import —
+                              #   a map's grid is not in the main bundle
+    hollowmere/environment.ts # Palette, fog, mist, particles — night
+    hollowmere/collision.ts   # GENERATED collider boxes (`npm run collision`)
+    greyfen/layout.ts         # The second map, being built: the jungle manor
+                              #   on C, a stilt-hut settlement and a temple on
+                              #   the other flags, and the trestle over the river
+    greyfen/heights.ts        # GENERATED floor heights — a Y-shaped river,
+                              #   wadeable everywhere (banks grade at 0.22).
+                              #   LAZY, like every heights.ts
+    greyfen/environment.ts    # Palette, fog, sun, sky, shafts — a jungle
+                              #   morning two hours after sunrise
+    greyfen/collision.ts      # GENERATED collider boxes (`npm run collision`)
+    coldharbour/layout.ts     # The third map: a city's business district. The
+                              #   first that is not 240 m (`size: 320`), the
+                              #   first that stacks floors (`surfaces: 4`) and
+                              #   the only one with `vehicles` on it
+    coldharbour/heights.ts    # GENERATED floor heights — dead level under the
+                              #   city, a 1.2 m skirt into the rim outside it.
+                              #   LAZY, like every heights.ts
+    coldharbour/environment.ts# Palette, sun, sky — a clear afternoon, and the
+                              #   first map with no fog wall (`fogEnd: 480`)
+    coldharbour/collision.ts  # GENERATED collider boxes (`npm run collision`)
+    harrowmead/layout.ts      # The fourth map: a farming town in a green
+                              #   vale. The largest yet (`size: 400`) — five
+                              #   farmyard flags in rolling, hedged country,
+                              #   and the second map with armour on it
+    harrowmead/heights.ts     # GENERATED floor heights — rolling hills and a
+                              #   stream carved to a constant wadeable bed.
+                              #   The biggest at 51 KB, and LAZY
+    harrowmead/environment.ts # Palette, sun, sky — high summer, late
+                              #   morning, no fog wall (`fogEnd: 520`)
+    harrowmead/collision.ts   # GENERATED collider boxes (`npm run collision`)
+    sarab/layout.ts           # The fifth map, and the one ENGINE_UPGRADE.md
+                              #   exists for: a desert town, 900 m of play
+                              #   inside 1500 m of ground. SEEDED by
+                              #   `npm run sarab` and owned by the editor after
+                              #   that — its header carries the argument. The
+                              #   first map to state `blockSize`/`terrainBlock`
+                              #   and the first whose `fogEnd` is inside its own
+                              #   diagonal
+    sarab/heights.ts          # GENERATED with it — dunes, each quarter
+                              #   flattened dead level, and a wadi cut through
+                              #   all of it. 226x226 vertices, the biggest in
+                              #   the tree by an order of magnitude, and LAZY
+    sarab/environment.ts      # Palette, high sun, dust — an hour before noon,
+                              #   and the first spec written for a map that can
+                              #   be FOGGED (`fogEnd: 560` inside a 1273 m
+                              #   diagonal) and the first to state a
+                              #   `bodyDrawDistance`
+    sarab/collision.ts        # GENERATED collider boxes (`npm run collision`)
+    cinderhaven/layout.ts     # The sixth map and the biggest: a harbour town on
+                              #   a volcanic island at night, 1500 m of play
+                              #   inside 2000 m of ground. SEEDED by
+                              #   `npm run cinderhaven` on Sarab's precedent.
+                              #   The first map whose FLOOR is the level — what
+                              #   is land, where the sea goes and which slopes
+                              #   sever are one function — and the first whose
+                              #   town is generated as a STREET NETWORK with
+                              #   the houses turned to face it. A C-shaped
+                              #   island round a wadeable bay, with a control
+                              #   point on the rock in the middle of it and
+                              #   every waterfront DERIVED from where the floor
+                              #   crosses the sea rather than authored
+    cinderhaven/heights.ts    # GENERATED with it — a harmonic coast, a 120 m
+                              #   cone masked by it, CINDER BAY cut through
+                              #   both, and Chapel Rock raised in the middle of
+                              #   the bay after the cut. 251x251 vertices, the
+                              #   biggest in the tree, and LAZY
+    cinderhaven/environment.ts# Palette, sky and light — and the one map lit
+                              #   from the MOUNTAIN rather than from a moon, so
+                              #   the disc, the halo and every god ray hang
+                              #   over the crater
+    cinderhaven/collision.ts  # GENERATED collider boxes (`npm run collision`)
+    proving/layout.ts         # DEV ONLY, and NOT a level: the proving ground
+                              #   ENGINE_UPGRADE.md S0 measures against. A city
+                              #   block grid at Coldharbour's collider density
+                              #   over a play square several times the size.
+                              #   GENERATED (`npm run proving`), gated out of
+                              #   every bundle by `scripts/check-proving.mjs`
+    proving/heights.ts        # GENERATED with it — level under the streets, and
+                              #   the third string check-proving.mjs greps for
+    proving/collision.ts      # GENERATED with them, by `npm run collision --
+                              #   proving`, and the only reason the AUTHORITY can
+                              #   be run on this map (ENGINE_UPGRADE.md S9). The
+                              #   fourth string check-proving.mjs greps for
+    proving/environment.ts    # The one hand-written file there. A dry noon
+                              #   with `fogEnd` past the map's own diagonal, so
+                              #   nothing measured on it is hidden by weather
+  ui/                   # One .css beside each module that writes markup
+    base.css            #   Reset, canvas, #hud root, and ONLY primitives two
+                        #   or more screens share — including THE SHELL every
+                        #   screen between the title and the world is framed
+                        #   in: .ui-screen (head / body / foot, edge-anchored,
+                        #   fluid), .ui-veil (+.ui-solid over another screen),
+                        #   .ui-rail, .ui-panel, .ui-facts, .ui-foot.
+                        #   Imported by main.ts
+    HUD.ts/hud.css      # Gameplay chrome ONLY: tickets, flags, capture panel,
+                        #   vitals, ammo, the stowed slot, hitmarker, killfeed,
+                        #   score feed, scoreboard, damage arcs, +
+                        #   .paused/.editing/.dying. NO crosshair: the fitted
+                        #   sight is the only aim mark in the game
+    OverlayScreen.ts    # The four cards — menu, round-over, pause, building —
+      overlay.css       #   the .overlaid class they raise, and #menu-shot, the
+                        #   map photograph the menu stands on: a second root of
+                        #   its own so it survives the card being rewritten and
+                        #   stays UNDER the veil, drifting, behind a scrim
+                        #   raked across the frame rather than the shell's
+                        #   centred one. The menu is a
+                        #   LIST: MENU_ITEMS is the cursor's whole world, drawn
+                        #   as a rail of two GROUPS — the map a stepper and a
+                        #   ladder, never a strip of buttons — with a DOSSIER
+                        #   beside it describing the row the cursor is on, the
+                        #   one .ui-panel in the tree that is a plate. The
+                        #   pause is the one card that
+                        #   does not take the screen — left-anchored over a
+                        #   round that is still worth seeing
+    MapThumb.ts         # The menu panel's map schematic, drawn from a map's
+                        #   LAYOUT (heightfield relief, water, scatter masses,
+                        #   placements, lettered flags) and coloured from its
+                        #   EnvironmentSpec. Never touches a built GameMap —
+                        #   the menu is the one screen where there is none.
+                        #   A water rect is an extent, not a shape: the
+                        #   waterline is baked from the heightfield here the
+                        #   same way the real bed depth is
+    mapShots.ts         # The PHOTOGRAPH behind the menu: one shot per map
+                        #   (shots/<id>.jpg, imported ?url) and the VANTAGE it
+                        #   was taken from, which is what lets `npm run shots`
+                        #   retake it rather than hunt for the frame again. A
+                        #   map with no row here simply has no backdrop. Not a
+                        #   field on MapDef, because the SERVER imports those
+    DeployScreen.ts     # Top-down deploy map, with the orders panel beside it
+      deploy.css        #   rather than under it. The offer is live, so the
+                        #   highlight is held by IDENTITY; in a netplay round a
+                        #   confirm is a REQUEST and says so
+    LoadoutScreen.ts    # Kit screen: four slots, a stat chart derived from
+      loadout.css       #   CONFIG.weapons, and the bay the turntable stands
+                        #   in — which it MEASURES and reports every frame
+                        #   (stageBay), so the layout is free and the weapon
+                        #   follows the hole. A strip, three columns, and a
+                        #   band across the top of a phone
+    SettingsScreen.ts   # Controls built from a ROW TABLE, in PAGES — a button
+      settings.css      #   group, or a slider where the ladder is too long for
+                        #   one (the thumb picks an option INDEX, so both are
+                        #   the same choice). Row 0 is the page selector, which
+                        #   is why tabs need no key of their own; the Controls
+                        #   page carries the key-cap table the menu used to.
+                        #   Owns no setting: picks leave through onChange and
+                        #   return as setValues
+    LobbyScreen.ts      # The match browser: every region's matches in one list
+      lobby.css         #   with a region column and a ping per row, plus
+                        #   region/map/new/refresh/back. Rows are DERIVED from
+                        #   the results, and everything off a network is written
+                        #   with textContent. Fetches nothing — Game hands it a
+                        #   region list and each region's answer as it lands,
+                        #   and takes onJoin/onCreate/onPickRegion/onPickMap
+                        #   back. A match row is a REGION and an id (ids are
+                        #   minted per process, so every region has an m1). The
+                        #   Region and Map rows are what a match CREATED here
+                        #   starts in and on; joining one takes that match's
+                        #   server and map, and onJoin carries both. One region
+                        #   collapses it to the three-column screen it was
+    Minimap.ts          # Corner minimap, player-centred and heading-up: flags,
+      minimap.css       #   friendlies, firing enemies, and a rim marker for
+                        #   every control point the zoomed view does not reach.
+                        #   The one canvas that RESIZES itself: the box is
+                        #   --hud-map and the backing store follows it
+    ProfileChip.ts      # The frame profiler's corner of the HUD: what the ring
+      profile.css       #   is holding, and the four buttons that get a capture
+                        #   off the device or into the reader. A DEVICE on #hud
+                        #   like TouchControls, not a screen. The buttons exist
+                        #   because the pointer is LOCKED — F3 is the desktop
+                        #   path to KEEP, and a phone has only the buttons.
+                        #   VIEW hands the full report to
+                        #   public/profile_viewer.html through localStorage,
+                        #   which works only because the reader is on the game's
+                        #   OWN ORIGIN; VIEWER_PATH here is one of the three
+                        #   places that path is spelled. Delivery (clipboard,
+                        #   then execCommand, then download) is this file's;
+                        #   the ring is never reached for
+    TouchControls.ts    # The on-screen controls a phone plays with: a FLOATING
+      touch.css         #   movement stick in the left zone, a look DRAG in the
+                        #   right one, and the button cluster over both. A
+                        #   DEVICE, not a screen that acts — InputManager polls
+                        #   it (setTouchSource) exactly as it polls a gamepad,
+                        #   so nothing in gameplay has heard of it. The one
+                        #   thing on it that is not input is the pause button,
+                        #   which a phone has no Escape key for. Game pushes the
+                        #   two states it draws but cannot know (crouched, and
+                        #   the magazine wanting attention) and decides when it
+                        #   is up: `playing`, and only while touch is the
+                        #   device in hand
+    ping.ts             # What a latency LOOKS like — the text and the quality
+                        #   band, shared by the scoreboard's column and the
+                        #   lobby's reading so the two cannot disagree. No
+                        #   markup and no stylesheet of its own
+  net/                # Multiplayer, client side. Nothing here is constructed
+    protocol.ts       #   in an offline round.
+                      #   The wire format — the ONLY module the server also
+                      #   imports. Pure types + the rates both ends must agree
+                      #   on. No Babylon, no DOM, no CONFIG
+    Connection.ts     #   Socket lifetime, reconnect, and the server-clock
+                      #   offset every interpolated body is drawn against
+    NetSession.ts     #   One networked round: the seam between Game and the
+                      #   wire. Game gains a field and a branch, not a protocol
+    NetRoster.ts      #   The pool of NetSoldiers + mirrored flags/tickets.
+                      #   The client's stand-in for BattleSystem: same job on
+                      #   screen, none of the job underneath
+    NetGrenades.ts    #   Everybody else's grenades in the air, interpolated on
+                      #   the same clock as the bodies. The thrower's own is
+                      #   skipped — they are watching their local copy
+    NetVehicles.ts    #   Somebody else's armour: one interpolation buffer per
+                      #   HARDSTANDING, feeding Vehicle.updateRemote. Owns no hull
+                      #   — the fleet is VehicleSystem's on both sides — and the
+                      #   hull the local player is driving is skipped, because
+                      #   they are simulating it
+    NetOrdnance.ts    #   The AT kit off the wire: rockets interpolated like
+                      #   grenades, mines applied whole from the versioned
+                      #   `mines` table. The shooter's own rocket is skipped;
+                      #   their own mine is NOT, because it is never predicted
+    lobby.ts          #   GET /matches for ONE region. The only part of
+                      #   multiplayer that is not the WebSocket. Times its own
+                      #   request, which is the ping shown beside that region —
+                      #   and owns clearRequestTimings, without which that
+                      #   timing is not recorded at all
+    regions.ts        #   Which match servers exist: the read of
+                      #   public/regions.json, and the arithmetic that turns a
+                      #   region's HOST into its socket and its list URL. Both
+                      #   are resolved together, so browsing one server and
+                      #   joining another is not representable
+    HitCredits.ts     #   Rounds this client already cued a hitmarker for, and
+                      #   the rule that a landed round is announced ONCE: a
+                      #   FIFO queue of predicted hits the authority's verdict
+                      #   claims. Expiring, so a round the server scored as a
+                      #   miss leaves nothing standing. Cues nothing itself
+    RegionBook.ts     #   WHICH region this client browses and joins: the list
+                      #   once read, the player's pick, the fastest-answering
+                      #   pick for one who has none, and ?server=. resolve() is
+                      #   the funnel every socket and every list goes through.
+                      #   Draws nothing and stores nothing — choose()/note()
+                      #   hand back the row for Game to light up
+  pwa/
+    register.ts         # SW registration, the update check that is the only
+                        #   thing that ever looks for a new build, and the
+                        #   touch fullscreen gesture.
+                        #   Knows nothing about the game
+    sw.js               # The service worker, as a TEMPLATE — not typechecked,
+                        #   never imported; vite.config.ts emits dist/sw.js.
+                        #   Network-first for the navigation, cache-first for
+                        #   the content-hashed rest
+  shaders/
+    CelShader.ts        # Custom cel ShaderMaterial. Both stages WGSL; six
+                        #   defines, six UBO layouts
+    CelInk.ts           # THE INK: one full-screen edge over the depth the
+                        #   frame already wrote. Replaced Babylon's outline
+                        #   hull AND MapBuilder's ink twins — Coldharbour
+                        #   +32%, Harrowmead +51%. Only ever DARKENS
+    FrameDepth.ts       # The frame's own depth attachment, captured once and
+                        #   wrapped for the two passes that sample it (the ink's
+                        #   edges, the blur's weapon mask). Renders and copies
+                        #   nothing; owns no pass
+    EmissiveFog.ts      # The same fog as a material plugin on every unlit
+                        #   emissive material — windows, flames, tracers. WGSL
+                        #   only, which is what isCompatible states
+    Dither.ts           # One LSB of triangular noise, in the three surface
+                        #   shaders. Fixes 8-bit banding in the fog. Owns the
+                        #   ARGUMENT and the WGSL; wgsl/includes.ts registers
+                        #   it as celDither
+    wgsl/
+      includes.ts       # The shader text every surface shares, as Babylon WGSL
+                        #   includes: celBand, celShadow, celProbe, celProbeBox,
+                        #   celDither and our own celInstances pair. Registered
+                        #   at import, so a consumer imports it for the side
+                        #   effect
+    WaterShader.ts      # Water ShaderMaterial: analytic wave trains, Fresnel
+                        #   mirror, and the hole a rotor tears in it. WGSL
+    GrassShader.ts      # The blade bend: wind, and combatants pushing through.
+                        #   WGSL
+    GodRays.ts          # Moon shafts: screen-space radial blur. WGSL
+    MotionBlur.ts       # Camera-rotation smear, reprojected from the aim
+                        #   angles. The viewmodel is held out of it by DEPTH —
+                        #   masked shift AND weighted taps — because a gun
+                        #   parented to the camera never moves in screen space.
+                        #   WGSL
+    HorrorPost.ts       # Vignette / grain / aberration / damage flash. WGSL
+```

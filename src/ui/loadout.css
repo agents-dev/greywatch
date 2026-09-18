@@ -1,0 +1,654 @@
+/**
+ * loadout.css — The kit screen: the weapon strip, the fitting column, the bay
+ * the turntable stands in, the chart, and the way the three of them rearrange.
+ * Owns: #loadout and the #hud.kitting rule that hides every other screen while
+ * it is up.
+ *
+ * **THE BAY IS MEASURED, WHICH IS WHY THIS SHEET IS FREE.** The weapon is the
+ * live viewmodel drawn by the scene on the canvas UNDER this overlay, placed by
+ * back-projecting a screen position — and that position used to be a CONSTANT
+ * in `CONFIG.viewmodel.inspect` welded to a `--panel: 46%` declared here. Two
+ * files that had to be changed together meant one possible layout: a
+ * full-height column beside a full-height hole, with everything else on the
+ * screen squeezed into the column. `LoadoutScreen.stageBay` measures `.lo-well`
+ * every frame now and the weapon goes wherever it is, so this file may put the
+ * hole anywhere — and does: the middle of three columns on a desktop, the
+ * right-hand two-thirds on a tablet, a band across the top of a phone with the
+ * rest of the screen scrolling underneath it.
+ *
+ * Two rules survive that change and both are about the same thing:
+ * - **The bay carries no background.** Everything here is DOM and DOM is above
+ *   the canvas, so a wash over the bay dims the one thing the screen exists to
+ *   show. What the weapon is read against is a card hung behind it IN THE SCENE
+ *   (`CONFIG.viewmodel.inspect.backdrop`).
+ * - **…and because that card is cut to the WHOLE FRUSTUM, this screen no longer
+ *   needs a scrim at all.** The map is already gone before a pixel of this
+ *   sheet is drawn, which is what lets the panels be plates with air between
+ *   them rather than one opaque column with a hard edge down the middle of the
+ *   window. The old `.lo-scrim` was doing a job something else had taken over.
+ *
+ * `--ov-scale` (base.css) still does not reach this screen, but the REASON it
+ * could not has gone: a transform moves the measured rect along with the hole,
+ * so the weapon would follow it now. It is left out because the layout below
+ * fits the viewports it is given on its own, which is the better answer.
+ */
+
+/* --- the frame ---
+   Four bands and three columns between them. The head and the foot run to
+   the glass because they are chrome; the three columns in the middle are
+   what the screen is:
+
+     head ──────────────────────────────
+     WEAPON strip (six equal shares)
+     fit column │      bay      │ chart
+     foot ──────────────────────────────
+
+   The split is by what each thing IS. The weapon is the decision the other
+   three depend on, so it gets the width; the optic, the anti-tank item and
+   the finish are what is fitted to it, so they are one column of lists; the
+   chart and the copy are the only things here that are read rather than
+   pressed, so they are the other column; and the bay is what is left, which
+   is the biggest hole the screen can give the thing it is about.
+
+   The middle column is `2.4fr` against the sides' `0.85fr` and `1fr` because
+   the bay is the only track whose content has no width of its own — the two
+   side columns are sized by their longest name and would take whatever they
+   were given. Their MINIMUMS are `clamp()`ed rather than fixed for the same
+   reason: what a column has to fit is a word, and a word set at a size that
+   falls with the viewport needs less room on the viewport where there is
+   less. */
+#loadout {
+  position: absolute;
+  inset: 0;
+  z-index: 11;
+  pointer-events: auto;
+  display: grid;
+  grid-template-columns:
+    minmax(clamp(148px, 14vw, 212px), 0.85fr)
+    minmax(0, 2.4fr)
+    minmax(clamp(186px, 16vw, 250px), 1fr);
+  /* Five rows, and the fifth is EMPTY on purpose. The two blocks in the left
+     column want to be their natural height and stacked against the top, which
+     is what `auto` rows give them — so the slack has to go somewhere, and a
+     spare row under them is where. Put it in the `fit` row instead (`1fr`) and
+     the finish grid floats to the bottom of the column with a hole above it,
+     which reads as a mistake rather than as a layout. `minmax(0, auto)` on the
+     two block rows is what lets a short window take the slack back out of
+     them, biggest first, rather than pushing the foot off the screen. */
+  grid-template-rows:
+    auto
+    auto
+    minmax(0, auto)
+    minmax(0, auto)
+    minmax(0, 1fr)
+    auto;
+  grid-template-areas:
+    "head head head"
+    "pick pick pick"
+    "fit  bay  read"
+    "fin  bay  read"
+    ".    bay  read"
+    "foot foot foot";
+  gap: clamp(8px, 1.5vmin, 18px) clamp(10px, 1.5vw, 26px);
+  /* Tighter than `--ui-pad-x`, which is 88 px a side on a monitor. This is
+     the densest screen in the interface and the one whose whole complaint was
+     that it had nowhere to put anything; a gutter that wide is 176 px of the
+     window spent on nothing. */
+  padding: clamp(10px, 2vh, 26px) clamp(12px, 2.2vw, 46px);
+}
+#loadout .lo-head { grid-area: head; }
+#loadout .lo-bay { grid-area: bay; }
+#loadout .lo-pick { grid-area: pick; }
+#loadout .lo-fit { grid-area: fit; }
+#loadout .lo-finish { grid-area: fin; }
+#loadout .lo-read { grid-area: read; }
+#loadout .lo-foot { grid-area: foot; }
+/* The wrapper around the three placeable blocks is `display: contents` here
+   and a real, SCROLLING box on a phone — see the portrait query at the foot
+   of this file. One element with two jobs, rather than two copies of the
+   markup for the narrow case. */
+#loadout .lo-choices { display: contents; }
+
+/* --- the bay ---
+   A hole with a plate under it. `.lo-well` is the hole, and it is the element
+   the screen MEASURES: what is reported has to be the empty box the weapon can
+   stand in, not the box with a caption written across the bottom of it. */
+#loadout .lo-bay {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  cursor: grab;
+}
+#loadout .lo-bay.turning { cursor: grabbing; }
+#loadout .lo-well {
+  position: relative;
+  flex: 1 1 auto;
+  /* A floor, so a short window cannot squeeze the hole to nothing and leave
+     the weapon fitted to a sliver. Below this the bay stops giving way and the
+     columns beside it scroll instead. */
+  min-height: clamp(120px, 26vh, 320px);
+}
+/* Corner ticks, so the hole reads as a bay the weapon is standing in rather
+   than as a gap where a panel failed to load. On the well's OWN corners: a
+   pair set in from them by a percentage reads as two specks floating in the
+   dark rather than as a bracket around anything, which is what the first cut
+   of this screen did at 5%. */
+#loadout .lo-well::before,
+#loadout .lo-well::after {
+  content: "";
+  position: absolute;
+  width: clamp(16px, 2.2vmin, 30px);
+  height: clamp(16px, 2.2vmin, 30px);
+  border: 1px solid rgba(255, 230, 128, 0.28);
+  pointer-events: none;
+}
+#loadout .lo-well::before {
+  top: 0;
+  left: 0;
+  border-right: 0;
+  border-bottom: 0;
+}
+#loadout .lo-well::after {
+  bottom: 0;
+  right: 0;
+  border-left: 0;
+  border-top: 0;
+}
+/* The plate under the weapon: what is on the turntable, what it is painted
+   with, and how to turn it. It is the one piece of copy on this screen that is
+   not in a column, and the finish is why — see LoadoutScreen's header. */
+#loadout .lo-plate {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding-top: clamp(6px, 1.2vh, 14px);
+  text-align: center;
+}
+#loadout .lo-stage-cap {
+  font-size: clamp(11px, 1.4vmin, 15px);
+  font-weight: 800;
+  letter-spacing: 0.26em;
+  text-transform: uppercase;
+  color: var(--hot);
+}
+/* The measure is what makes this readable: the bay is the widest track on the
+   screen, and a sentence run across all of it at 11 px is one line the eye has
+   to travel. Sentence case, because it is a sentence — everything else on the
+   plate is a label. */
+#loadout .lo-stage-note {
+  max-width: 56ch;
+  font-size: clamp(10px, 1.15vmin, 12px);
+  line-height: 1.6;
+  color: var(--dim);
+}
+#loadout .lo-stage-note b {
+  display: block;
+  margin-bottom: 3px;
+  font-size: var(--ui-cap);
+  font-weight: 700;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.72);
+}
+#loadout .lo-stage-hint {
+  font-size: var(--ui-cap);
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--dimmer);
+}
+
+/* --- a block: a caption over a list ---
+   Every pick on this screen is one of these, so the four rows are one control
+   drawn four ways rather than four controls. The hull is `.frame`'s, shared
+   with the gauges and the menu's panels, which is what makes the two custom
+   properties below the whole of the selection treatment: the ACTIVE block —
+   the one the arrow keys are stepping — takes the hot colour as its edge and
+   lifts its fill, and nothing else has to change. */
+#loadout .lo-block {
+  display: flex;
+  flex-direction: column;
+  gap: clamp(4px, 0.8vh, 9px);
+  min-width: 0;
+  padding: clamp(7px, 1.1vmin, 13px) clamp(9px, 1vw, 16px);
+  --cham: clamp(9px, 1.4vmin, 16px);
+  --frame-edge: rgba(255, 255, 255, 0.09);
+  --frame-fill: rgba(7, 10, 16, 0.82);
+}
+#loadout .lo-block.active {
+  --frame-edge: rgba(255, 230, 128, 0.55);
+  --frame-fill: rgba(16, 19, 28, 0.88);
+}
+#loadout .lo-cap {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: var(--ui-cap);
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+#loadout .lo-block.active .lo-cap { color: rgba(255, 230, 128, 0.8); }
+/* The FINISH block's caption names the row AND the pick, which no other block
+   here has to: its options are swatches with no words on them, so this is
+   where the lit one is named. It is the caption rather than a line under the
+   grid because the caption is already there and already the right size — a
+   name in the hot colour beside a dim label reads as the value of the row, the
+   way the head's "Carried" slot does.
+
+   The bay's paragraph names it too, and that is not a duplicate: the paragraph
+   is the first thing a short viewport drops, and a grid of unnamed colours with
+   no name anywhere on the screen would be exactly the row-you-try-one-at-a-time
+   the swatches exist to avoid. */
+#loadout .lo-cap em {
+  font-style: normal;
+  letter-spacing: 0.14em;
+  color: var(--hot);
+}
+
+/* --- the buttons ---
+   One base, two shapes. A CARD stacks its name over its figures and is what
+   the weapon strip is made of; a LINE puts the name at one end and the figure
+   at the other and is what a list row is. They differ in nothing else, which
+   is why the highlight, the hover and the bevel are stated once. */
+#loadout button.lo-opt {
+  font: inherit;
+  display: flex;
+  min-width: 0;
+  padding: clamp(6px, 0.9vmin, 10px) clamp(8px, 0.9vw, 12px);
+  text-align: left;
+  color: #cdd6e6;
+  background: rgba(255, 255, 255, 0.05);
+  border: 0;
+  cursor: pointer;
+  clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
+  transition: background 0.12s, color 0.12s;
+}
+#loadout button.lo-opt b {
+  font-size: clamp(10px, 1.15vmin, 13px);
+  font-weight: 700;
+  /* Tracked tighter than the rest of the screen's captions, and this is the
+     one place that is worth doing: the widest word on any of these is
+     "SUBMACHINE", ten characters, so tracking is charged ten times over on the
+     button that has least to spare. */
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  /* WRAPS, and an ellipsis is what it replaces. Two names in this kit are long
+     enough to overrun a narrow column — "Submachine Gun" and "Anti-Vehicle
+     Mines" — and a truncated name is worse than a tall row: "ANTI-VEHICLE MI…"
+     says less than the caption above it already does. Every list here is a
+     GRID, so a row whose tallest cell has wrapped stretches the rest to match
+     and the column stays on its rhythm. */
+  line-height: 1.2;
+}
+/* The figures — the magnification as a lens is marked, a weapon's damage and
+   fire mode, an anti-tank item's count and what it is worth against a hull.
+   Tabular so a column of them lines up rather than shuffling by a pixel. */
+#loadout button.lo-opt i {
+  font-style: normal;
+  font-size: clamp(9px, 1vmin, 11px);
+  letter-spacing: 0.1em;
+  font-variant-numeric: tabular-nums;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--dim);
+}
+#loadout button.lo-opt:hover { background: rgba(255, 230, 128, 0.18); color: var(--hot); }
+#loadout button.lo-opt.on { color: #12141a; background: var(--hot); }
+#loadout button.lo-opt.on i { color: rgba(18, 20, 26, 0.62); }
+
+/* --- the weapon strip ---
+   SIX EQUAL SHARES IN ONE ROW, and the grid is the correctness part rather
+   than the style. This was a wrapping flex row, and where a flex row breaks is
+   decided by a `flex-basis` that had to be tuned per viewport in four media
+   queries — with a note telling the next person to MEASURE the break by hand
+   whenever a weapon was added, because a stranded button (five on one line and
+   one alone underneath at the full width of the column) is invisible to a
+   typecheck and to a review of the diff. `grid-auto-flow: column` cannot
+   strand: N items are N equal columns at every width there is, and the narrow
+   query below changes the COUNT rather than the break. */
+#loadout .lo-cards {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  gap: clamp(4px, 0.5vw, 8px);
+}
+#loadout button.lo-card {
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 3px;
+  min-height: clamp(38px, 5.4vh, 56px);
+}
+
+/* --- a list ---
+   The optic row and the anti-tank row. A list rather than a row of six,
+   because one-word names with a figure at the right-hand end read down a
+   column in one glance — and because a list of six is six rows at every width
+   there is, which is the same argument the strip above makes sideways. */
+#loadout .lo-list {
+  display: grid;
+  grid-auto-flow: row;
+  gap: clamp(3px, 0.5vh, 5px);
+}
+#loadout button.lo-line {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: clamp(24px, 3.4vh, 34px);
+}
+
+/* --- the finish grid ---
+   Sixteen schemes, offered on every weapon, and NO NAMES on them. A finish
+   says what it does with COLOUR, because its name cannot — "Verdigris" and
+   "Oxblood" are words you have to try one at a time — and at sixteen the name
+   is not merely redundant, it is four LINES of buttons. So the button IS the
+   swatch, and the name is the block's caption, the paragraph under the weapon,
+   and a `title` under the pointer.
+
+   EIGHT COLUMNS rather than `auto-fit`: the table is sixteen, so eight is two
+   full lines with nothing stranded on a short one, and every swatch is the
+   same width whatever the column is doing. A seventeenth scheme would make it
+   three lines with a gap at the end — which is what a grid should look like
+   when a table stops being a round number, rather than the whole row resizing
+   under it. */
+#loadout .lo-swatches {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: clamp(3px, 0.4vw, 5px);
+}
+/* Three flat stops in the order the eye reads a weapon — furniture, receiver,
+   fittings. Hard stops, no gradient: these are three flat cel colours and a
+   blend between them would invent two more the weapon does not have.
+
+   The bevel is the option buttons' own, scaled to the smaller box, so the grid
+   reads as the same family of control as the lists above it. The dark inner
+   line is not decoration: `whitewash` and `frostbite` are pale enough to melt
+   into each other and into the plate without one. */
+#loadout button.lo-swatch {
+  height: clamp(16px, 2.6vh, 28px);
+  padding: 0;
+  border: 0;
+  cursor: pointer;
+  background: linear-gradient(
+    90deg,
+    var(--sw-a) 0 34%,
+    var(--sw-b) 34% 67%,
+    var(--sw-c) 67% 100%
+  );
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.55);
+  clip-path: polygon(6px 0, 100% 0, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0 100%, 0 6px);
+  transition: box-shadow 0.12s;
+}
+/* The selected swatch is RINGED rather than filled, which is the one place
+   this screen's `.on` treatment has to change its mind: every other button
+   says it is chosen by taking the hot colour as its background, and a swatch
+   that did that would paint over the only thing it has to say. The ring is
+   INSET because a clip-path cuts an outer shadow off, and the dark line inside
+   it keeps the hot edge off whatever colour the scheme puts behind it. */
+#loadout button.lo-swatch:hover {
+  box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.75);
+}
+#loadout button.lo-swatch.on {
+  box-shadow: inset 0 0 0 2px var(--hot), inset 0 0 0 3px rgba(0, 0, 0, 0.7);
+}
+
+/* --- the two columns beside the bay ---
+   Both SCROLL rather than clip, and that is the fix for the one failure the
+   old screen had at every size: a column that ran out of room simply put its
+   last row under the bottom edge of the window with no way to reach it. A
+   column here gives way in the order it is written — the chart is above the
+   copy, the lists are above the swatches — and whatever is left over is
+   scrolled to rather than lost. */
+#loadout .lo-fit,
+#loadout .lo-read {
+  display: flex;
+  flex-direction: column;
+  /* TOP-aligned, and that is a composition decision rather than a default.
+     Centred, the two columns start at two different heights — they hold
+     different amounts — and two left-aligned things at two different y is the
+     misalignment the eye picks out of any layout. Against the top they share
+     one line with the bay's own top edge, straight across under the weapon
+     strip, and what is ragged is the bottom, which is where a column of panels
+     is allowed to be ragged. */
+  justify-content: flex-start;
+  gap: clamp(6px, 1.2vh, 14px);
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+#loadout .lo-perf { flex: 0 0 auto; }
+/* `min-width` only, and NOT `align-self: start` — which is what this said
+   first, and which is a bug in one of the two layouts. Its row is `auto` in
+   both grids, so a block already sizes to its own content vertically; but in
+   the PORTRAIT tier the same element is a flex child of the scroller, where
+   `align-self` is the CROSS axis and start means shrink-wrapped to the width
+   of sixteen minimum-width swatches — a 130 px strip in a full-width column.
+   A property that means two different axes in two layouts has to be set in the
+   one it is about, or not at all. */
+#loadout .lo-finish { min-width: 0; }
+
+/* --- the chart ---
+   Six bars, each that weapon's figure against the best any weapon has, so the
+   chart re-scales itself when a weapon is added rather than dating.
+
+   The three cells are NAMED areas because the block is laid out twice: as a
+   row on a column-shaped chart (name, bar, figure), and as a stack when the
+   chart is a full-width strip under the bay on a narrower window (name and
+   figure on one line, bar under them). Two arrangements of three cells, and no
+   second copy of the markup. */
+#loadout .lo-stats {
+  display: grid;
+  gap: clamp(4px, 0.8vh, 8px);
+}
+#loadout .lo-stat {
+  display: grid;
+  grid-template-columns: minmax(52px, auto) minmax(0, 1fr) minmax(44px, auto);
+  grid-template-areas: "name bar val";
+  align-items: center;
+  gap: 10px;
+}
+#loadout .lo-stat-name {
+  grid-area: name;
+  font-size: var(--ui-cap);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+#loadout .lo-bar {
+  grid-area: bar;
+  display: block;
+  height: 5px;
+  background: rgba(255, 255, 255, 0.09);
+}
+#loadout .lo-bar u {
+  display: block;
+  height: 100%;
+  background: var(--hot);
+  transition: width 0.16s ease-out;
+}
+#loadout .lo-stat-val {
+  grid-area: val;
+  font-size: clamp(10px, 1.1vmin, 12px);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: #cfd6e2;
+}
+
+/* --- the copy ---
+   What each pick is FOR, in the player's terms. It is the first thing a short
+   viewport drops, for the reason it is the last thing in the column: the
+   names, the figures and the weapon itself are the screen, and the prose is
+   the part you can read on a desk instead. */
+#loadout .lo-blurbs {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 2px clamp(2px, 0.4vw, 6px) 0;
+}
+#loadout .lo-blurb {
+  font-size: clamp(10px, 1.1vmin, 12px);
+  line-height: 1.6;
+  color: rgba(255, 255, 255, 0.55);
+}
+#loadout .lo-blurb.dim {
+  padding-top: 8px;
+  border-top: 1px solid var(--rule);
+  color: rgba(255, 255, 255, 0.38);
+}
+
+/* While the kit is up, everything else under #hud goes dark — the menu, the
+   deploy map, the gauges, the killfeed, all of it. The weapon in the bay is
+   NOT DOM: it is drawn by the scene on the canvas below every one of these, so
+   anything left standing paints over it.
+
+   `#hud-fps` is carved out: it is an instrument rather than chrome, and the kit
+   screen is a perfectly reasonable place to want to read the frame rate. */
+#hud.kitting > *:not(#loadout):not(#hud-fps) { visibility: hidden; }
+
+/* ==========================================================================
+   HOW IT GIVES WAY
+
+   Three tiers, and each is keyed on the thing that actually runs out:
+   1. the CHART's column, which needs ~200 px beside a bay to be a chart;
+   2. HEIGHT, which is what a landscape phone has none of;
+   3. the WIDTH under which two columns stop being two columns at all.
+   ========================================================================== */
+
+/* --- 2. a short window, which is a phone held sideways ---
+   The HEAD is the first thing out: it names a screen the player has just
+   pressed a button to open, and what the slot opposite says is already under
+   the weapon. Then the PROSE, then the room between everything. The lists go
+   two-up rather than shrinking their rows, because a 34 px row is what a thumb
+   needs and the second column is free — it is width this viewport has and
+   height it has not. */
+@media (max-height: 620px) {
+  /* The two side columns are given more of the width, because the height is
+     what has run out and the lists are about to be laid TWO-UP to save some.
+     What pays is the bay, which is the only track that can: it is the one
+     thing here that has no natural size, and a 440 px bay on a 844 px phone is
+     still the biggest hole on the screen. */
+  #loadout {
+    grid-template-columns:
+      minmax(clamp(176px, 22vw, 224px), 1fr)
+      minmax(0, 1.7fr)
+      minmax(clamp(168px, 21vw, 208px), 0.9fr);
+    /* THE FINISH GOES UNDER THE CHART. The fitting column here is six optics
+       and two anti-tank items in about 215 px of height, so sixteen swatches
+       under them are below the fold on a screen with no obvious way to scroll
+       — while the chart's column is six bars and nothing else, with room to
+       spare on exactly this viewport. It is the same block either way; only
+       which area it is placed in moves. */
+    grid-template-rows: auto auto minmax(0, 1fr) auto auto;
+    grid-template-areas:
+      "head head head"
+      "pick pick pick"
+      "fit  bay  read"
+      "fit  bay  fin"
+      "foot foot foot";
+    gap: clamp(5px, 1vmin, 10px) clamp(8px, 1.2vw, 18px);
+    padding: clamp(6px, 1.4vh, 14px) clamp(10px, 1.8vw, 30px);
+  }
+  /* The HEAD is the first thing out: it names a screen the player has just
+     pressed a button to open, and what its right-hand slot says is written
+     under the weapon anyway. Then the PROSE, on both sides — the names, the
+     figures and the weapon itself are the screen, and the copy is the part you
+     can read on a desk instead. */
+  #loadout .lo-head { display: none; }
+  #loadout .lo-blurbs { display: none; }
+  #loadout .lo-stage-note { display: none; }
+  #loadout .lo-block { gap: 3px; padding: 6px 9px; }
+  /* TWO-UP, and the rows become CARDS to pay for it: a name beside its figure
+     needs the width of both, and a name over its figure needs only the wider
+     of the two — which is what makes two columns fit at all in a track that
+     held one. The tracking comes off for the same reason it was ever tight
+     here: "LONG SCOPE" is charged for it ten times. */
+  #loadout .lo-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  /* …except the anti-tank one, whose two names are the longest in the kit:
+     "Anti-Vehicle Mines" in half of a 180 px column is three lines of type to
+     save one row. */
+  #loadout .lo-kit { grid-template-columns: minmax(0, 1fr); }
+  #loadout button.lo-line {
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: center;
+    gap: 1px;
+  }
+  #loadout button.lo-opt b { letter-spacing: 0.05em; }
+  #loadout .lo-well { min-height: clamp(96px, 20vh, 200px); }
+}
+/* Shorter still, and what goes is the height of the weapon cards — the one
+   thing left that is bigger than it has to be. Nothing is dropped here: the
+   chart is the reason to pick one weapon over another and a phone is not a
+   place to be told less. */
+@media (max-height: 430px) {
+  #loadout button.lo-card { min-height: 30px; }
+  #loadout button.lo-line { min-height: 30px; }
+}
+
+/* --- 3. one column, which is a phone held upright ---
+   The bay is a BAND across the top at a fixed share of the height, and
+   everything else scrolls under it — which is what `.lo-choices` is for: it is
+   `display: contents` at every width above this one, and here it becomes the
+   real box that does the scrolling. The weapon is pinned in its band while the
+   list moves under it, and it stays framed there because the bay is measured
+   rather than assumed.
+
+   Keyed on width alone, and deliberately: the tier above is about height and
+   takes the head with it, while a tall narrow window has room for a head and
+   no room for two columns. */
+@media (max-width: 720px) {
+  #loadout {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      "head"
+      "bay"
+      "choices"
+      "foot";
+    padding: clamp(6px, 1.4vh, 14px) clamp(10px, 3vw, 20px);
+  }
+  #loadout .lo-choices {
+    grid-area: choices;
+    display: flex;
+    flex-direction: column;
+    gap: clamp(6px, 1.2vh, 12px);
+    min-height: 0;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+  }
+  #loadout .lo-bay { height: clamp(150px, 30vh, 300px); }
+  #loadout .lo-well { min-height: 0; }
+  /* The three placeable blocks are ordinary flex children of the scroller now,
+     so their grid areas mean nothing and their own scrolling would be a box
+     inside a box. */
+  #loadout .lo-fit,
+  #loadout .lo-read {
+    overflow: visible;
+    flex: 0 0 auto;
+  }
+  #loadout .lo-read { flex-direction: column; }
+  #loadout .lo-blurbs { flex-direction: column; }
+  #loadout .lo-blurb.dim {
+    padding: 8px 0 0;
+    border-top: 1px solid var(--rule);
+    border-left: 0;
+  }
+  /* The strip stops being a strip: at this width six shares are 55 px each,
+     which is narrower than the word "Submachine" can be set at any size worth
+     reading. `auto-fit` over a floor is the one place this screen wraps, and
+     it wraps into ALIGNED columns rather than a stranded flex line — a
+     seventh card would sit under the first at the same width. */
+  #loadout .lo-cards {
+    grid-auto-flow: row;
+    grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  }
+  #loadout .lo-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  #loadout .lo-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

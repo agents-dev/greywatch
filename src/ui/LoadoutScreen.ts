@@ -1,0 +1,816 @@
+/**
+ * LoadoutScreen.ts — The kit screen: pick a weapon, fit an optic, paint the
+ * thing, turn it over in your hands, and read what the trade costs.
+ * Owns: its own DOM under `#hud`, the four-slot selection model, the stat
+ * table it derives from `CONFIG.weapons`, the pointer drags over its bay, and
+ * the MEASUREMENT of that bay. It reports choices and redraws nothing on its
+ * own — `Game` applies a pick and calls `setFit` back, so the highlighted
+ * button can never get ahead of the weapon in the player's hands.
+ *
+ * The weapon in the middle is not a picture: it is the real viewmodel, the one
+ * that will be in the player's hands, posed on a turntable by `ViewModel` and
+ * drawn by the live scene behind this overlay.
+ *
+ * **THE BAY IS MEASURED, AND THAT IS THE ONE THING TO UNDERSTAND BEFORE
+ * MOVING ANYTHING ON THIS SCREEN.** The weapon is placed by back-projecting a
+ * screen position, and that position used to be a constant in
+ * `CONFIG.viewmodel.inspect` welded to a CSS percentage: the panel was the
+ * left 46% of the viewport and the anchor said 0.46, in two files that had to
+ * be changed together. Which meant the screen had exactly one possible layout
+ * — a full-height column beside a full-height hole — and everything else on
+ * it was squeezed into that column until the column was a stack of ten
+ * buttons, a chart and three paragraphs with the footer under the bottom edge
+ * of the window, next to half a screen of empty bay. `stageBay` reports the
+ * hole instead, every frame, and the weapon goes wherever the hole is. Move
+ * the layout freely; the weapon follows.
+ *
+ * Two consequences still run through the file:
+ * - **The bay is a hole, not a panel.** The weapon is on the canvas and every
+ *   part of this screen is above it, so the bay carries no background of its
+ *   own. What the weapon is read against is a card hung behind it IN THE SCENE
+ *   (`CONFIG.viewmodel.inspect.backdrop`) — which, since it is cut to the
+ *   whole frustum, is also why the panels around the bay can be plates with
+ *   air between them rather than one opaque scrim: the map is already gone.
+ * - **`show()` marks `#hud`** so the CSS can hide the menu and the deploy map
+ *   while the kit is up: they are DOM too, and either would paint over the
+ *   weapon.
+ *
+ * **THE LAYOUT IS THREE ZONES AND A STRIP**, and the split is by what each
+ * kind of thing IS rather than by what fits where:
+ * - the WEAPON is the decision the other three depend on, so it is a strip of
+ *   six cards across the top, under the head — the widest thing on the screen
+ *   for the choice that changes what every other row means;
+ * - the OPTIC, the ANTI-VEHICLE item and the FINISH are what is fitted to it,
+ *   so they are the column down the left;
+ * - the BAY is the middle;
+ * - and the CHART and the copy are the right-hand column, because they are the
+ *   only things here that are read rather than pressed.
+ *
+ * The FINISH is a placeable block of its own rather than a third block inside
+ * that column, and it earns the extra element on a landscape PHONE: the
+ * fitting column there is six optics and two anti-tank items in about 215 px,
+ * so sixteen swatches under them fell below the fold on a screen with no
+ * obvious way to scroll — while the chart's column is six bars and nothing
+ * else. Given a grid area, the swatches move under the chart on exactly that
+ * viewport and stay in the left-hand column everywhere else. The stylesheet
+ * decides; nothing here knows which.
+ *
+ * **A ROW OF PICKS IS A GRID OF EQUAL SHARES, NEVER A WRAPPING FLEX ROW**, and
+ * that is a correctness rule rather than a style. A flex row cannot be squeezed
+ * below its own longest word, so it breaks — and where it breaks depended on a
+ * `flex-basis` tuned per viewport in four media queries, with a comment in the
+ * stylesheet telling the next person to MEASURE the break by hand whenever a
+ * weapon or an optic was added, because a stranded button is invisible to a
+ * typecheck and to a review of the diff. A grid of `1fr` columns cannot strand:
+ * six equal shares are six equal shares at every width, and a narrow viewport
+ * takes a different COUNT of columns rather than a different break. All of that
+ * tuning is gone with it.
+ *
+ * **The FINISH row is the one that is not a trade**, and it is the one row that
+ * is not drawn like the others either. Every other choice on this screen costs
+ * something — a magnification is a field of view, a weapon is a rate against a
+ * magazine — and a finish costs nothing at all, so it has no bar on the chart
+ * and never touches one. What it has instead is the BAY: its NAME and its
+ * description are written under the weapon rather than beside the bars,
+ * because it is the only pick here whose whole effect is the thing already
+ * turning on the turntable.
+ *
+ * **All sixteen are offered on every gun** (`FINISH_IDS` — the finish table
+ * stopped being five lists of four), and sixteen is what makes the row a GRID
+ * OF SWATCHES rather than sixteen more buttons with names on them. A finish
+ * says what it does with COLOUR, because its name cannot: "Verdigris" and
+ * "Oxblood" are words you have to try one at a time, and the row exists
+ * precisely so you do not have to. So the button IS the swatch — three flat
+ * colours in the order they sit on the weapon — and the name is the row's own
+ * caption, the paragraph under the weapon, and a `title` under the pointer.
+ *
+ * The grid is redrawn with everything else when a pick is made, and what moves
+ * in it when the WEAPON row steps is only the highlight: the list is the same
+ * sixteen for every gun, and which one is lit is that gun's own remembered
+ * finish (`prefs.readFinish`, one key each).
+ *
+ * A screen rather than a row, because there are three slots now and the row it
+ * replaces was a strip of buttons wedged under a menu that already had a
+ * difficulty picker on it. It is reachable from the MAIN MENU and from the
+ * DEPLOY screen, and deliberately not from the pause menu: a round you are
+ * already standing in is not somewhere you get to change what you are
+ * carrying. Nothing enforces that with a flag; the states that can open it are
+ * the states that offer the button.
+ *
+ * The stat bars are DERIVED from the weapon table rather than authored. Each
+ * one is that weapon's number against the best number any weapon has, so a
+ * third weapon added to CONFIG re-scales the chart instead of dating it.
+ *
+ * "Any weapon" means `PRIMARY_WEAPON_IDS` throughout — the sidearm is in the
+ * same table and is not a choice, so it appears on neither the buttons nor the
+ * scale. Ranking against a weapon nobody can decline would shrink every bar on
+ * the screen to say something the player cannot act on.
+ *
+ * CSS contract: `#hud` is `pointer-events: none`, so this overlay opts back in
+ * — the same carve-out `#deploy` takes.
+ */
+import "./loadout.css";
+import { CONFIG } from "../config";
+import {
+  DEFAULT_FINISH,
+  finishBlurb,
+  finishName,
+  finishSwatch,
+  FINISH_IDS,
+  type FinishId,
+} from "../entities/finishes";
+import { EQUIPMENT_IDS, type EquipmentId } from "../entities/equipment";
+import type { StageBay } from "../entities/ViewModel";
+import { SIGHT_IDS, type SightId } from "../entities/sights";
+import {
+  carriedSetup,
+  PRIMARY_WEAPON_IDS,
+  type CarriedId,
+  type PrimaryWeaponId,
+  type WeaponId,
+} from "../entities/weapons";
+
+/**
+ * Which row of the kit the keyboard/pad is currently stepping through.
+ *
+ * In the order the choices depend on each other: the weapon decides what
+ * optics and what finishes the other two rows are even allowed to offer, so it
+ * is the one the cursor opens on and the one above the other two.
+ */
+type Slot = "weapon" | "sight" | "equipment" | "finish";
+
+/**
+ * The rows, in that order, with and without the anti-tank slot.
+ *
+ * **Two lists rather than one filtered at the point of use**, because the row
+ * is genuinely absent rather than disabled: on a map with no armour there is
+ * nothing the launcher could be used on, and a greyed row saying so would be
+ * the kit screen explaining a rule instead of the map simply not having it.
+ * `Game` decides which of these is in force — see `MapLayout.vehicles`.
+ *
+ * It sits between the OPTIC and the FINISH, which is the dependency order the
+ * first three were already in: the weapon decides what the two rows under it
+ * may offer, the AT slot decides nothing and is decided by nothing, and the
+ * finish is the row that is not a trade at all and stays at the bottom next to
+ * the stage it is about.
+ */
+const SLOTS: readonly Slot[] = ["weapon", "sight", "finish"];
+const ARMED_SLOTS: readonly Slot[] = ["weapon", "sight", "equipment", "finish"];
+
+/**
+ * What each weapon is for, in the player's terms. Copy, not configuration —
+ * every number these describe lives in `CONFIG.weapons` and is read from there
+ * for the buttons and the bars rather than written twice.
+ */
+export const WEAPON_BLURBS: Record<PrimaryWeaponId, string> = {
+  rifle:
+    "A full-power battle rifle. Four rounds kill at any distance you can see a target at, and it holds its group across the valley — but the magazine is short and every round has to be worth its recoil.",
+  carbine:
+    "A bullpup, and the trigger buys three rounds rather than one. All three land in a tenth of a second and all three together are a kill — then the weapon sits out four tenths whether they hit or not, which makes a wasted burst the most expensive mistake in the kit.",
+  smg: "Pistol-calibre, and it empties a long magazine in under three seconds. Quickest to the shoulder, cheapest to miss with, and past the width of a street it will not group whatever optic is on top of it.",
+  dmr: "Semi-automatic: one round per trigger pull, and two rounds anywhere on a man will do it. The tightest group in the kit short of the bolt gun, paid for with a kick that has to be ridden back down before the second shot means anything — but you keep your sight picture the whole way, which is the thing the sniper cannot offer.",
+  sniper:
+    "Bolt-action, and one round anywhere on a man is a kill at any range it reaches. Then you work the bolt: a second and a quarter with the rifle off your target and no way to hurry it, which is the whole price of the weapon and is charged whether the round landed or not. Five in the magazine, nothing to offer inside a room, and a sidearm you will need.",
+  lmg: "Belt-fed, and the only weapon here that does not have to stop: seventy-five rounds is fifteen kills without a pause, and the group barely opens across the whole belt. Slowest into the shoulder, useless from the hip, and a reload long enough that being caught empty is a decision about the sidearm.",
+};
+
+/**
+ * What each anti-tank item is for. Copy, not configuration — every number
+ * these describe lives in `CONFIG.equipment` and is read from there for the
+ * buttons rather than written twice.
+ */
+const EQUIPMENT_BLURBS: Record<EquipmentId, string> = {
+  rpg: "Two rockets and no way to get a third. The rocket FLIES — a second and a half across an avenue — so a moving hull has to be led and a driver who sees the smoke has that long to decide something. Both of them into the same tank is a dead tank; either of them into a doorway is most of a squad.",
+  mine: "Two plates, laid on the ground and armed a beat later, and only a vehicle is heavy enough to set one off — your own infantry walk over them, and so does everybody else's. They outlive you, but you may only have two out: lay a third and the first one is lifted. It is the only weapon here that works while you are somewhere else.",
+};
+
+/**
+ * What each optic is for. The numbers these describe live in `CONFIG.sights`,
+ * and the magnification on each button is read from there.
+ */
+const SIGHT_BLURBS: Record<SightId, string> = {
+  reflex:
+    "A lit dot in an open frame, and the least magnification on offer. Nothing to line up and nothing in the way — the clearest picture in the kit, a fraction slower up than the irons already standing on the rail.",
+  iron: "Rear aperture over a hooded post. Nothing to switch on and the fastest to the shoulder, paid for with a post that covers whatever it is aimed at.",
+  holo: "A lit ring and dot floating in a tube optic. The issued sight: enough magnification to pick a target out of the dark, little enough to swing between two.",
+  prism:
+    "A short prismatic body on an integral mount, with an etched chevron. Enough magnification to make a body across the square worth shooting at, and enough field left to swing onto the next one.",
+  scope:
+    "Telescopic, with a duplex reticle. Slow to bring up and a tunnel to look down, and the only thing on offer that will show you a body at the far end of the valley.",
+  longScope:
+    "Six times, on the biggest optic in the kit. It will show you a man at three hundred metres and it will show you nothing else at all — the field is half the scope's, the slowest thing here into the shoulder, and it magnifies your own hands along with everything you are looking at.",
+};
+
+/** One bar on the stat chart: a caption, the figure, and its share of the best. */
+interface StatRow {
+  label: string;
+  value: string;
+  frac: number;
+}
+
+/** Formats a magnification the way a lens is marked. */
+function magLabel(id: SightId): string {
+  return `${CONFIG.sights[id].magnification.toFixed(1)}×`;
+}
+
+/** The largest value of one field across every weapon — the bars' full scale. */
+function best(pick: (w: (typeof CONFIG.weapons)[WeaponId]) => number): number {
+  return Math.max(...PRIMARY_WEAPON_IDS.map((id) => pick(CONFIG.weapons[id])));
+}
+
+/** The smallest, for the fields where less is better (spread). */
+function least(pick: (w: (typeof CONFIG.weapons)[WeaponId]) => number): number {
+  return Math.min(...PRIMARY_WEAPON_IDS.map((id) => pick(CONFIG.weapons[id])));
+}
+
+/**
+ * Rounds a weapon actually delivers per second, held down.
+ *
+ * For everything but the carbine that is `fireRate` itself. A burst weapon's
+ * `fireRate` is the rate WITHIN its burst — 20/s on a weapon that fires six —
+ * and charting that would put the longest bar in the kit against the lowest
+ * sustained output in it, which is the opposite of what the bar is for. The
+ * burst's own rate is not lost: it is what the damage bar is about, since the
+ * three rounds arrive together.
+ */
+function sustainedRate(w: (typeof CONFIG.weapons)[WeaponId]): number {
+  if (w.burst <= 1) return w.fireRate;
+  return w.burst / (w.burstCycle + (w.burst - 1) / w.fireRate);
+}
+
+/**
+ * How a weapon's trigger behaves, in the one word a button has room for.
+ *
+ * The burst carries its COUNT, because that is the number the mode is about —
+ * three rounds is the difference between a kill on one pull and 68 damage and
+ * a wait. `semiAuto` is not mentioned for a burst weapon even though it is set:
+ * "one pull, one burst" is what "burst" already means to anyone reading it.
+ */
+function fireMode(w: (typeof CONFIG.weapons)[WeaponId]): string {
+  if (w.burst > 1) return `burst ×${w.burst}`;
+  // A bolt gun is `semiAuto` too and "semi" would be true and useless — it is
+  // what the DMR says, and the two weapons are as far apart as anything in the
+  // kit. What the word has to carry is that the trigger is not the thing you
+  // are waiting for, which is the same job "burst" does above.
+  if (w.boltCycle) return "bolt";
+  return w.semiAuto ? "semi" : "auto";
+}
+
+/**
+ * The chart for one weapon. Accuracy is the AIMED spread inverted — a bar
+ * that grows with the number would rank the SMG as the accurate one — and is
+ * shown in degrees, which is the only unit that means anything at a glance.
+ *
+ * Rate is left as a bare figure even though it means something different on a
+ * semi-automatic (a ceiling on the trigger finger, not a cadence): the value
+ * column is 52px and "3/s semi" does not fit in it. The fire mode is on the
+ * weapon's own button instead, next to the number it qualifies.
+ *
+ * **Two rows carry fall-off, and both had to.** Damage prints BOTH ends of the
+ * curve, because one number is now a half-truth — the SMG's 18 and the LMG's 24
+ * rank one way in a room and the other way at 40 m. The bar stays keyed to the
+ * close figure, which is the one a weapon is picked to win a room with. A
+ * weapon with no fall-off prints one number, and on the two that do it that is
+ * their whole case made without a sentence.
+ *
+ * **The chart is RELATIVE and the sniper is what proves it costs nothing.**
+ * Every bar is a share of the best figure in the kit, so a weapon that sets a
+ * new best shortens every other bar in that row — 100 damage against the
+ * rifle's 30 takes the rifle's damage bar to under a third of the width it used
+ * to draw. That is the chart working rather than breaking: the rifle has not
+ * changed, and what the row is for is saying where a weapon sits among the ones
+ * it is being chosen against. Pinning the scale to an absolute instead would
+ * mean every bar in the kit needing a re-tune the day a weapon is added.
+ *
+ * Range is `falloffFar`, **not** `range`, and that is a correction rather than
+ * a choice: `range` is where the ray stops, which since fall-off arrived is no
+ * longer the interesting end of the weapon. The DMR's 180 m is mostly spent
+ * past a fog wall at 78, and the SMG's rounds carry to 70 m having stopped
+ * being worth firing at 40. The distance a player can act on is the one where
+ * the damage runs out.
+ */
+function weaponStats(id: PrimaryWeaponId): StatRow[] {
+  const w = CONFIG.weapons[id];
+  const deg = (rad: number) => ((rad * 180) / Math.PI).toFixed(2);
+  const rate = sustainedRate(w);
+  return [
+    {
+      // Both ends of the curve, because one number is now a half-truth: the
+      // SMG's 18 and the LMG's 24 rank one way close and the other way at
+      // 40 m. The bar itself stays keyed to the CLOSE figure — that is the
+      // one a player is choosing a weapon to win a room with — and the value
+      // column says what happens to it. A weapon with no fall-off (the DMR and
+      // the sniper) prints one number, which is the whole of its case.
+      label: "Damage",
+      value:
+        w.damageFar === w.damage
+          ? `${w.damage}`
+          : `${w.damage}–${w.damageFar}`,
+      frac: w.damage / best((x) => x.damage),
+    },
+    {
+      label: "Rate",
+      value: `${rate % 1 === 0 ? rate : rate.toFixed(1)}/s`,
+      frac: rate / best(sustainedRate),
+    },
+    {
+      label: "Magazine",
+      value: `${w.magSize}`,
+      frac: w.magSize / best((x) => x.magSize),
+    },
+    {
+      label: "Accuracy",
+      value: `±${deg(w.spreadAds)}°`,
+      frac: least((x) => x.spreadAds) / w.spreadAds,
+    },
+    {
+      // `falloffFar`, NOT `range`. `range` is where the ray stops, and since
+      // fall-off arrived it is no longer the interesting end of the weapon:
+      // the DMR's 180 m is most of it spent past a fog wall at 78, while the
+      // SMG's rounds carry to 70 m and stopped being worth firing at 40. The
+      // distance a player can act on is the one where the damage runs out —
+      // and on the sniper, which never runs out, `falloffFar` is still the
+      // honest figure, because past it the round is unchanged and the LIMIT is
+      // whether the map has anything that far away to shoot at.
+      label: "Range",
+      value: `${w.falloffFar} m`,
+      frac: w.falloffFar / best((x) => x.falloffFar),
+    },
+    {
+      label: "Handling",
+      value: `${w.adsSpeedMult.toFixed(2)}×`,
+      frac: w.adsSpeedMult / best((x) => x.adsSpeedMult),
+    },
+  ];
+}
+
+/** The kit as one line, for the menu button and the HUD's magazine caption. */
+export function kitLabel(weapon: CarriedId, sight: SightId): string {
+  return `${carriedSetup(weapon).name} · ${CONFIG.sights[sight].name}`;
+}
+
+export class LoadoutScreen {
+  private root: HTMLElement;
+  /**
+   * The rebuilt half: every list, every button and the chart. The head, the
+   * bay and the foot are written once and only ever have their text set.
+   */
+  private choices: HTMLElement;
+  /**
+   * The HOLE, and the element `stageBay` measures. It is the bay MINUS its
+   * plate: what is reported has to be the empty box the weapon can stand in,
+   * not the box with the caption written across the bottom of it.
+   */
+  private well: HTMLElement;
+  /** The caption under the weapon on the bay's plate. */
+  private stageCap: HTMLElement;
+  /**
+   * What the FINISH is, said under the weapon rather than in a column.
+   *
+   * The other three picks are written up beside their bars because what they
+   * cost is invisible — a magnification is a field of view, a burst is four
+   * tenths of a second. A finish costs nothing and its whole effect is the
+   * thing on the turntable, so its copy belongs where the eye already is.
+   */
+  private stageNote: HTMLElement;
+  /** The same caption in the head's right-hand slot. */
+  private carriedEl: HTMLElement;
+  /**
+   * Drag accumulated since `Game` last read it. Pixels, not radians — how far
+   * a pixel turns the weapon is the viewmodel's business, and this screen has
+   * no opinion about it.
+   */
+  private dragX = 0;
+  private dragY = 0;
+  private weapon: PrimaryWeaponId = PRIMARY_WEAPON_IDS[0];
+  private sight: SightId = SIGHT_IDS[0];
+  /**
+   * The finish on the CARRIED weapon. The LIST does not turn over with the
+   * weapon — every gun is offered all sixteen — but which one is lit does,
+   * because the pick is remembered per gun.
+   */
+  private finish: FinishId = DEFAULT_FINISH;
+  /** Which row the d-pad is on. Left/right steps inside it; up/down swaps it. */
+  private slot: Slot = "weapon";
+  /** The AT item the kit has, whether or not this map offers the row. */
+  private equipment: EquipmentId = EQUIPMENT_IDS[0];
+  /** Whether this map has armour on it, and therefore whether the row exists. */
+  private armour = false;
+  /**
+   * The bay handed back when there is nothing to measure — the screen hidden,
+   * or a frame before the first layout. A full-viewport bay is the answer that
+   * cannot put the weapon somewhere silly; it frames it as the middle of the
+   * window, which is where a turntable with no screen around it belongs.
+   */
+  private readonly wholeScreen: StageBay = { x: 0, y: 0, width: 1, height: 1 };
+
+  /** Wired by Game. Each reports a choice; none of them redraws. */
+  onWeapon: (id: PrimaryWeaponId) => void = () => {};
+  onSight: (id: SightId) => void = () => {};
+  onFinish: (id: FinishId) => void = () => {};
+  onEquipment: (id: EquipmentId) => void = () => {};
+  onClose: () => void = () => {};
+
+  constructor() {
+    this.root = document.createElement("div");
+    this.root.id = "loadout";
+    this.root.className = "hidden";
+    // Five grid items, and the middle one is a wrapper that is `display:
+    // contents` on a wide viewport — so `.lo-pick`, `.lo-fit`, `.lo-finish`
+    // and `.lo-read` are grid items of `#loadout` itself and can be placed
+    // anywhere in it, while on a phone the same wrapper becomes a real box
+    // that SCROLLS with the bay pinned above it. One element, two jobs, and no
+    // second copy of the markup for the narrow case.
+    //
+    // The FINISH block is a placeable item of its own rather than a third
+    // block inside `.lo-fit`, and that is what a landscape phone needed: the
+    // fitting column there holds six optics and two anti-tank items in about
+    // 215 px, so sixteen swatches under them were below the fold on a screen
+    // that does not obviously scroll. Given an area, they move under the CHART
+    // instead, which is the column with room to spare on exactly that
+    // viewport.
+    this.root.innerHTML = `
+      <div class="lo-head">
+        <div class="ui-head">
+          <div class="ui-titles">
+            <span class="ui-eyebrow">Kit</span>
+            <h2>Loadout</h2>
+          </div>
+          <div class="ui-meta">
+            <span>Carried</span>
+            <b class="lo-carried"></b>
+          </div>
+        </div>
+      </div>
+      <div class="lo-bay">
+        <div class="lo-well"></div>
+        <div class="lo-plate">
+          <span class="lo-stage-cap"></span>
+          <p class="lo-stage-note"></p>
+          <span class="lo-stage-hint">Drag &middot; right stick to turn</span>
+        </div>
+      </div>
+      <div class="lo-choices"></div>
+      <p class="lo-foot ui-foot">
+        <span><kbd>&larr;</kbd><kbd>&rarr;</kbd><kbd class="pad">Stick</kbd> choose</span>
+        <span><kbd>&uarr;</kbd><kbd>&darr;</kbd><kbd class="pad">Stick</kbd> slot</span>
+        <button class="ui-back"><kbd>Esc</kbd><kbd class="pad">B</kbd> Back</button>
+      </p>
+    `;
+    document.getElementById("hud")!.appendChild(this.root);
+    this.choices = this.root.querySelector(".lo-choices")!;
+    this.well = this.root.querySelector(".lo-well")!;
+    this.stageCap = this.root.querySelector(".lo-stage-cap")!;
+    this.stageNote = this.root.querySelector(".lo-stage-note")!;
+    // The head's right-hand slot names the same kit the bay's caption does,
+    // and is written by the same call — see `draw`. It is the screen's own
+    // read-back for the case where the bay is scrolled off a phone.
+    this.carriedEl = this.root.querySelector(".lo-carried")!;
+    this.bindBay(this.root.querySelector<HTMLElement>(".lo-bay")!);
+    // The pointer's way off this screen, in the footer every lid screen ends
+    // with (`.ui-foot` / `.ui-back` in base.css). It reads "Back" and not
+    // "Done" for the reason it is shared at all: a pick is applied the moment
+    // it is made, exactly as on the settings screen, so there is nothing here
+    // to be finished with — and two screens that leave the same way should not
+    // use two words for it. Enter and A still close this one (they have
+    // nothing else to do here, where settings spends them on the row's value),
+    // and the chips name the pair that works on all three.
+    //
+    // `click` is safe here where the buttons that OPEN this screen need
+    // pointerdown: the state under it takes its confirm from a mouse-down,
+    // and by the time a click fires that button is already back up.
+    this.root.querySelector<HTMLElement>("button.ui-back")!.onclick = () =>
+      this.onClose();
+    this.draw();
+  }
+
+  /**
+   * The hole the weapon stands in, as the browser has just laid it out.
+   *
+   * Read once a frame from `Game.updateKitStage`, which is the whole of what
+   * makes this screen's layout free: any arrangement the stylesheet can
+   * express is one the weapon will be in the middle of, at any window size, in
+   * either orientation, and while a phone's list is being scrolled underneath
+   * it. Nothing here is cached — the read lands on a layout nothing has
+   * dirtied since the last frame (this screen writes DOM only when a pick is
+   * made), so it costs a lookup rather than a reflow, and a cache is a fifth
+   * thing that can disagree with where the hole actually is.
+   *
+   * Measured against the ROOT rather than against `window`, because the root
+   * is `inset: 0` over the canvas and is therefore the same box the aspect
+   * ratio is taken from — and because a screen ever drawn inside a transform
+   * would move both of them together.
+   */
+  stageBay(): StageBay {
+    const box = this.root.getBoundingClientRect();
+    const well = this.well.getBoundingClientRect();
+    if (box.width < 1 || box.height < 1 || well.width < 1 || well.height < 1)
+      return this.wholeScreen;
+    return {
+      x: ((well.left + well.width / 2 - box.left) / box.width) * 2 - 1,
+      y: 1 - ((well.top + well.height / 2 - box.top) / box.height) * 2,
+      width: well.width / box.width,
+      height: well.height / box.height,
+    };
+  }
+
+  /**
+   * Turns the weapon under a mouse drag.
+   *
+   * `setPointerCapture` is what makes a drag that leaves the bay — over a
+   * column, off the window — keep turning the weapon instead of stopping dead
+   * at the edge, which is the whole difference between a handle and a hotspot.
+   * Deltas are taken from `clientX/Y` rather than `movementX/Y`: the pointer is
+   * not locked here, and the movement fields are the ones this game reads only
+   * when it is.
+   *
+   * The handle is the whole BAY and not just the well: the plate under the
+   * weapon carries a caption and a sentence, and a finger that lands on a word
+   * on its way to the gun should still turn the gun.
+   */
+  private bindBay(bay: HTMLElement): void {
+    let last: { x: number; y: number } | null = null;
+    bay.addEventListener("pointerdown", (e) => {
+      last = { x: e.clientX, y: e.clientY };
+      bay.setPointerCapture(e.pointerId);
+      bay.classList.add("turning");
+    });
+    bay.addEventListener("pointermove", (e) => {
+      if (!last) return;
+      this.dragX += e.clientX - last.x;
+      this.dragY += e.clientY - last.y;
+      last = { x: e.clientX, y: e.clientY };
+    });
+    const end = () => {
+      last = null;
+      bay.classList.remove("turning");
+    };
+    bay.addEventListener("pointerup", end);
+    bay.addEventListener("pointercancel", end);
+  }
+
+  /**
+   * The drag since the last call, in pixels, and zeroed by reading it — the
+   * same consume-on-read shape `InputManager` gives mouse look, so a frame
+   * that never ran cannot turn the weapon twice.
+   */
+  consumeDrag(): { x: number; y: number } {
+    const drag = { x: this.dragX, y: this.dragY };
+    this.dragX = 0;
+    this.dragY = 0;
+    return drag;
+  }
+
+  /**
+   * Shows the kit that is actually fitted. Called by Game, never by a click.
+   *
+   * `armour` is the MAP's answer rather than the kit's — whether there is
+   * anything on the field an anti-tank item could be used on — and it is
+   * pushed through the same call as the four picks because it moves the same
+   * markup: a row appearing or going away is a redraw exactly as a pick is.
+   */
+  setFit(
+    weapon: PrimaryWeaponId,
+    sight: SightId,
+    finish: FinishId,
+    equipment: EquipmentId,
+    armour: boolean,
+  ): void {
+    if (
+      weapon === this.weapon &&
+      sight === this.sight &&
+      finish === this.finish &&
+      equipment === this.equipment &&
+      armour === this.armour
+    )
+      return;
+    this.weapon = weapon;
+    this.sight = sight;
+    this.finish = finish;
+    this.equipment = equipment;
+    this.armour = armour;
+    // A row that has just gone away cannot keep the cursor. Sent back to the
+    // top rather than to a neighbour: the weapon row is where `show` opens
+    // anyway, so this is the one answer that is never a surprise.
+    if (!armour && this.slot === "equipment") this.slot = "weapon";
+    this.draw();
+  }
+
+  /** The rows this map actually has. */
+  private get rows(): readonly Slot[] {
+    return this.armour ? ARMED_SLOTS : SLOTS;
+  }
+
+  show(): void {
+    // Always open on the weapon row: it is the choice that changes the other
+    // one's meaning, and a screen that remembers where you left the cursor
+    // three deploys ago is a screen you have to look at before you can use it.
+    this.slot = "weapon";
+    this.root.classList.remove("hidden");
+    // The screens this one covers are DOM, and the weapon it shows is not:
+    // either of them left up would paint over the bay. The CSS carries the
+    // rule; this is the flag it reads.
+    document.getElementById("hud")!.classList.add("kitting");
+    this.draw();
+  }
+
+  hide(): void {
+    this.root.classList.add("hidden");
+    document.getElementById("hud")!.classList.remove("kitting");
+    // A drag interrupted by the screen closing must not turn the weapon on the
+    // next open.
+    this.dragX = 0;
+    this.dragY = 0;
+  }
+
+  get visible(): boolean {
+    return !this.root.classList.contains("hidden");
+  }
+
+  /** Steps the active slot — the menu's up/down. */
+  moveSlot(delta: number): void {
+    const rows = this.rows;
+    const i = rows.indexOf(this.slot);
+    this.slot = rows[(i + delta + rows.length) % rows.length];
+    this.draw();
+  }
+
+  /**
+   * Steps the choice inside the active slot, wrapping at both ends — the
+   * menu's left/right. Reports it and leaves the drawing to `setFit`.
+   */
+  cycle(delta: number): void {
+    if (this.slot === "weapon") {
+      const n = PRIMARY_WEAPON_IDS.length;
+      const i = PRIMARY_WEAPON_IDS.indexOf(this.weapon);
+      this.onWeapon(PRIMARY_WEAPON_IDS[(i + delta + n) % n]);
+    } else if (this.slot === "sight") {
+      const i = SIGHT_IDS.indexOf(this.sight);
+      this.onSight(SIGHT_IDS[(i + delta + SIGHT_IDS.length) % SIGHT_IDS.length]);
+    } else if (this.slot === "equipment") {
+      const n = EQUIPMENT_IDS.length;
+      const i = EQUIPMENT_IDS.indexOf(this.equipment);
+      this.onEquipment(EQUIPMENT_IDS[(i + delta + n) % n]);
+    } else {
+      // Every finish there is, in the table's own order — which is the order
+      // the grid is drawn in, so a key press steps to the swatch next door
+      // and wraps off the end of the last line onto the first.
+      const n = FINISH_IDS.length;
+      const i = FINISH_IDS.indexOf(this.finish);
+      this.onFinish(FINISH_IDS[(i + delta + n) % n]);
+    }
+  }
+
+  /** The class a block wears when the arrow keys are on it. */
+  private mark(slot: Slot): string {
+    return this.slot === slot ? " active" : "";
+  }
+
+  /**
+   * Rebuilds the whole choices half rather than patching it. It is four lists
+   * and six bars, redrawn only when something is picked — and the alternative
+   * is five places that have to agree on which button carries the highlight.
+   */
+  private draw(): void {
+    // The weapon cards: the widest control on the screen, for the decision the
+    // other three depend on. A NAME, and under it the two figures that decide
+    // between them — what one round is worth and what the trigger does with
+    // it. Everything else about the weapon is on the chart, one column over.
+    const weapons = PRIMARY_WEAPON_IDS.map((id) => {
+      const w = CONFIG.weapons[id];
+      return `
+        <button class="lo-opt lo-card${id === this.weapon ? " on" : ""}" data-weapon="${id}">
+          <b>${w.name}</b><i>${w.damage} dmg &middot; ${fireMode(w)}</i>
+        </button>`;
+    }).join("");
+    // The optics, as a LIST rather than a row of six: one-word names with a
+    // figure at the right-hand end read down a column in one glance, and a
+    // list of six is six rows at every width there is.
+    const sights = SIGHT_IDS.map(
+      (id) => `
+        <button class="lo-opt lo-line${id === this.sight ? " on" : ""}" data-sight="${id}">
+          <b>${CONFIG.sights[id].name}</b><i>${magLabel(id)}</i>
+        </button>`,
+    ).join("");
+    // The AT row's two, in the same shape, and what each says at the right-hand
+    // end is the whole of what separates them: how many you get and what one is
+    // worth against a hull. Both figures are read off `CONFIG.equipment` rather
+    // than written here, the rule every other row on this screen follows.
+    const kit = EQUIPMENT_IDS.map((id) => {
+      const e = CONFIG.equipment[id];
+      return `
+        <button class="lo-opt lo-line${id === this.equipment ? " on" : ""}" data-equip="${id}">
+          <b>${e.name}</b><i>&times;${e.carried} &middot; ${e.damage}</i>
+        </button>`;
+    }).join("");
+    // The finish grid: sixteen swatches and not one word between them. Each is
+    // three custom properties the CSS lays down as flat bands in the order the
+    // eye reads a weapon — furniture, receiver, fittings — and the NAME is the
+    // block's caption, plus the paragraph under the weapon, plus a `title` for
+    // whichever the pointer is resting on.
+    //
+    // The names are the finish table's own literals, so there is nothing to
+    // escape here; the same is true of every other row on this screen.
+    const finishes = FINISH_IDS.map((id) => {
+      const [a, b, c] = finishSwatch(id);
+      const name = finishName(id);
+      return `
+        <button class="lo-swatch${id === this.finish ? " on" : ""}" data-finish="${id}"
+                title="${name}" aria-label="${name}"
+                style="--sw-a:${a};--sw-b:${b};--sw-c:${c}"></button>`;
+    }).join("");
+    const bars = weaponStats(this.weapon)
+      .map(
+        (s) => `
+        <div class="lo-stat">
+          <span class="lo-stat-name">${s.label}</span>
+          <span class="lo-bar"><u style="width:${(s.frac * 100).toFixed(1)}%"></u></span>
+          <span class="lo-stat-val">${s.value}</span>
+        </div>`,
+      )
+      .join("");
+
+    // The bay's own caption: what is actually on the turntable, named where
+    // the eye already is — and the same string in the head's slot, so a phone
+    // that has scrolled the bay away still says what is being carried.
+    const carried = kitLabel(this.weapon, this.sight);
+    this.stageCap.textContent = carried;
+    this.carriedEl.textContent = carried;
+    // The paint, named and described under the weapon it is on. Deliberately
+    // NOT folded into `kitLabel`: that string is also the HUD's magazine
+    // caption and the deploy screen's kit line, and neither of those is
+    // anywhere the colour of the gun is a thing you are choosing.
+    this.stageNote.innerHTML =
+      `<b>${finishName(this.finish)}</b>${finishBlurb(this.finish)}`;
+
+    this.choices.innerHTML = `
+      <section class="lo-block frame lo-pick${this.mark("weapon")}" data-slot="weapon">
+        <span class="lo-cap">Weapon</span>
+        <div class="lo-cards">${weapons}</div>
+      </section>
+      <div class="lo-fit">
+        <section class="lo-block frame${this.mark("sight")}" data-slot="sight">
+          <span class="lo-cap">Optic</span>
+          <div class="lo-list">${sights}</div>
+        </section>
+        ${
+          this.armour
+            ? `<section class="lo-block frame${this.mark("equipment")}" data-slot="equipment">
+          <span class="lo-cap">Anti-Vehicle</span>
+          <div class="lo-list lo-kit">${kit}</div>
+        </section>`
+            : ""
+        }
+      </div>
+      <section class="lo-block frame lo-finish${this.mark("finish")}" data-slot="finish">
+        <span class="lo-cap">Finish<em>${finishName(this.finish)}</em></span>
+        <div class="lo-swatches">${finishes}</div>
+      </section>
+      <div class="lo-read">
+        <section class="lo-block frame lo-perf">
+          <span class="lo-cap">Performance</span>
+          <div class="lo-stats">${bars}</div>
+        </section>
+        <div class="lo-blurbs">
+          <p class="lo-blurb">${WEAPON_BLURBS[this.weapon]}</p>
+          <p class="lo-blurb dim">${SIGHT_BLURBS[this.sight]}</p>
+          ${
+            this.armour
+              ? `<p class="lo-blurb dim">${EQUIPMENT_BLURBS[this.equipment]}</p>`
+              : ""
+          }
+        </div>
+      </div>
+    `;
+
+    // The swatches are picked exactly as the named buttons are — the two
+    // differ in what they LOOK like and in nothing else, so they share the one
+    // handler rather than the finish row growing a second way to be clicked.
+    const picks = "button.lo-opt, button.lo-swatch";
+    this.choices.querySelectorAll<HTMLElement>(picks).forEach((btn) => {
+      btn.onclick = () => {
+        const w = btn.dataset.weapon;
+        const f = btn.dataset.finish;
+        const e = btn.dataset.equip;
+        if (w) this.onWeapon(w as PrimaryWeaponId);
+        else if (f) this.onFinish(f as FinishId);
+        else if (e) this.onEquipment(e as EquipmentId);
+        else this.onSight(btn.dataset.sight as SightId);
+      };
+    });
+    // Hovering a block moves the keyboard slot with it, so the highlighted
+    // block and the one the arrow keys are about to step can never disagree —
+    // the same rule the pause menu's list follows.
+    this.choices
+      .querySelectorAll<HTMLElement>(".lo-block[data-slot]")
+      .forEach((row) => {
+        row.onmouseenter = () => {
+          const next = row.dataset.slot as Slot;
+          if (next !== this.slot) {
+            this.slot = next;
+            this.draw();
+          }
+        };
+      });
+  }
+}

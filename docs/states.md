@@ -1,0 +1,289 @@
+# The state machine: steps, lids, and what still moves under one
+
+What each game state IS, which of them are screens laid over another, and what a
+frame owes when there is one up — offline, where a lid genuinely holds the world,
+and in a netplay round, where it holds nothing at all. Split out of
+[`CLAUDE.md`](../CLAUDE.md), which keeps the summary; this file is the contract
+for `src/core/ScreenStack.ts` and for `Game`'s `tick`, `pause`/`resume` and every
+`open*`/`close*` next to them.
+
+## The machine does not exist until TWO awaits have resolved
+
+**`menu` is not the first thing that happens on the page, and the boot screen is
+what covers the stretch before it.** `main.ts` awaits two things before it
+constructs `Game` at all — the WebGPU device (an adapter, then `initAsync`) and
+the Havok WASM — and both are REQUIRED, so a failure of either is a sentence on
+the boot screen rather than a state anything below has to be written for. There
+is no `booting` state and there must not be one: the states in this file are
+states of a `Game` that exists, and everything before the constructor returns is
+`index.html`'s markup and `main.ts`'s three failure branches.
+
+**What that buys is the property ~40 smoke scripts rest on**: because both
+awaits are `main.ts`'s, the constructor stays SYNCHRONOUS, so `window.__celshock`
+is non-null with every pool built the moment it returns and the machine is in
+`menu` on the same tick. A `static async create()` would have moved the awaits
+inside and taken that away. `VERIFYING.md` says how to wait for it from a script
+— two awaits, not one, and neither of them is a frame count.
+
+## The cycle
+
+`Game`'s state machine is `menu -> loading -> deploy -> playing -> dying ->
+deploy`, with `roundover` when a side runs out of tickets. The 3D scene renders
+in **every** state, which is what lets the deploy screen and the menu sit over a
+live view.
+
+**`loading` is the map being built, and the split that creates it is the whole
+feature.** Building one is the better part of a second of synchronous work —
+merges, the occlusion bake, the nav grid — and a browser paints between TASKS,
+never inside one, so a `startRound` that built the map where it stood froze the
+card the player had just confirmed for the entire build and then jumped to the
+deploy screen. Nothing was slow that is not slow now; what was missing was any
+sign the game had heard the button. So `Game.startRound` raises the building
+card and hands the work to `Game.buildRound` **two** `requestAnimationFrame`s
+later, and the count is load-bearing: a frame runs its animation callbacks and
+*then* paints, so a single rAF booked from ordinary task code fires before the
+card has ever been on the glass and the freeze happens under the old screen
+exactly as before. One is enough from inside the render loop, which is where
+the real callers are — the second is what stops that being a property of the
+call site. It is a **STEP, not a lid**: nothing may simulate there (`tick` has
+a deliberately empty arm) because there is no map yet, and `buildPending`
+guards it so a second build can never be queued over a pending one.
+
+**And it no longer ends when the build does, because the build is no longer the
+whole of what the card covers.** `installMap` queues the reflection bake and
+that bake is spent a budget of draws per FRAME — so when the one synchronous
+turn of `buildRound` returns, none of it has happened yet
+([`docs/rendering.md`](rendering.md) has the argument). Those frames used to be
+the first frames of `deploy` and then of the round: one on every shipped map,
+and **47 of them over 44.8 seconds on a 1500 m map**, at about one frame a
+second, with the player looking at them. `Game.bakeWait` holds `loading` until
+`ReflectionSystem.bakePending` reaches 0 and then opens the deploy screen, and
+`loading` is the only state in the machine where those frames can go: it
+simulates nothing, and it still renders, which is exactly the kind of frame the
+bake needs. Measured either side, the same 47 frames cost 10.6 s instead of
+44.8 and none of them is in the round.
+
+Four things follow, and three of them are constraints rather than
+consequences:
+
+- **The card is up LONGER, which is more exposure to "nothing may simulate
+  here" rather than less.** Nothing was added to `tick`'s `loading` arm and
+  nothing may be: the wait is one call at the very END of `tick`, after the
+  render it is asking about, and all it does is read a queue and take a card
+  down.
+- **A queue that cannot drain must not hang the card**, and the state machine
+  has no concept of a step that fails. A probe re-bakes in full until every
+  mesh in its list has a compiled material, so the wait gives up on two
+  different failures — an outstanding count that stops MOVING, which no wall
+  clock can tell from a slow machine, and a bake that inches forward forever,
+  which no stall counter can catch — and lets the remainder land in the round
+  exactly as it did before. Both caps are `CONFIG.graphics.reflection`'s.
+- **`loading` is no longer the same question as "the build has not run yet"**,
+  and every guard that was asking the second one now asks `Game.buildPending`.
+  Reading the state alone would refuse a map rotation or a team correction
+  arriving from the authority for the whole length of the drain and drop it on
+  the floor, because the branch that defers to `buildRound` would be deferring
+  to a `buildRound` that already happened.
+- **The building card can finally say how far along it is.** The build itself
+  has no frames to report from — it is one task — but the bake has one per
+  batch, so `OverlayScreen.setBuildProgress` swaps the indeterminate sweep for
+  a measured fill the first time a frame goes by with the bake still
+  outstanding. Every shipped map drains on the first frame and never reaches
+  that call.
+
+**News from the authority that needs a world is HELD across `buildPending`, not
+applied and not dropped**, and there are two of them for the same reason.
+`NetSession.onSeated` defers a welcome to `buildRound`, which re-reads it on the
+far side of the heightfield fetch; `Game.pendingSpawn` holds a `spawn` — the one
+message that MOVES the local body — until `finishBakeWait`, which spends it
+THROUGH `enterDeploy` rather than instead of it, so a spawn out of `loading`
+gets the same funnel (the seat, the death cam, the viewmodel, the panels) that a
+spawn off the deploy screen does. Both run in one synchronous turn, so the screen
+that is opened and immediately answered never reaches the glass. Applied where it
+lands, the body went into a world that was about to be replaced and the build's
+own tail took the state straight back off it; DROPPED, the two sides disagree
+about whether there is a body at all — the client offers a deploy screen and
+`Match.onDeploy` refuses the ask behind it for the rest of the round, because a
+living player may not deploy. **The window is `buildPending` and only that.**
+During the bake drain the map is built, a spawn is honoured on the spot, and
+`go("playing")` ends the wait — which is what the wait's own give-up path does
+anyway. A build that is REPLACED (`startRound`) or ABANDONED (`leaveMatch`, which
+is where the heightfield that would not load and the map this build does not have
+both come out) drops the held spawn: both hand out a fresh body regardless, a
+rotation by retiring every player on the authority and a reconnect by seating
+this client into a new slot that is dead until it asks.
+
+**`dying` is the death cam and is a STEP, not a lid** — `updateWorld` runs in full
+underneath it. **`loadout`, `settings`, `lobby` and `paused` are lids**: a screen
+laid over a state, which taking it off puts back rather than moving the game on.
+The loadout screen covers `menu` or `deploy`; a pause covers `playing`, `dying` or
+`deploy`, so a pause taken while waiting out a respawn returns to the deploy map
+rather than dropping the player into the world.
+
+## The table, and why it is a table
+
+**Which is which, and what each one owes, is DECLARED — in `SCREENS` in
+[`src/core/ScreenStack.ts`](../src/core/ScreenStack.ts), one row per state, and
+the row is not optional.** The table is a `Record<GameState, ScreenSpec>`, so a
+new screen does not compile until it has answered all four questions, and
+`Game.tick` asks the table rather than trusting each screen to volunteer:
+
+| field | the question | answered `true` by |
+| --- | --- | --- |
+| `covers` | which states may this be raised over? (`null` makes it a step) | the four lids |
+| `holdsWorld` | offline, is the world under this genuinely stopped? | `paused` |
+| `roundBehind` | online, does the authority's fight carry on behind this with nothing else stepping it? | the lids, and `deploy` |
+| `inRound` | is the player in a round here — is the scoreboard owed? | `deploy`, `playing`, `dying` |
+
+This replaced three `-From` fields on `Game`, a two-deep chain of `if`s that
+peeled them, and four screens that each had to REMEMBER to step the half of a
+netplay frame a lid does not stop — a rule that was enforced by a comment saying
+the next screen owed the same call the day it was written. **The reason to keep
+it a table is that it fails loudly.** A fifth screen is a compile error until it
+answers, and its answers sit next to four that are already right, which is a
+different kind of review than reading a paragraph and hoping.
+
+`Game` holds one `ScreenStack` and has exactly three moves — `go` a step,
+`raiseLid`, `lowerLid` — and **nothing in the codebase assigns a game state**:
+`Game.state` is a getter over the stack. The fifty-odd places that ASK what state
+the game is in are unchanged by any of this; it is only the answering that is
+funnelled.
+
+**A step transition takes down whatever lids were up, and that is `go`'s job
+rather than the caller's.** The three transitions that leave a round — the menu, a
+round starting, F2 into the editor — each used to write out the same list of
+screens to put away, and the copies had already drifted: F2 from the lobby left
+the match list hanging over the editor's own panel. The other twelve wrote none
+of it, which was invisible offline (nothing moves the state while a lid is up
+when the player is the only thing deciding) and broken online, where the wire
+decides: a `died` landing under the settings screen overwrote `settings` with
+`deploy` and stranded the screen on top — visible, uncloseable, with the deploy
+screen live and taking input underneath it. `ScreenStack.go` hands back what was
+up and **`Game.takeDown` — exhaustive over `LidState`, enforced with a `never` —
+is the single place that knows what putting one away means.**
+
+**`#overlay` is the one screen that table cannot own, and it took the same bug a
+second time before it was moved into `go` beside the lids.** The menu, the
+round-over card and the building card are all one element and all belong to a
+STEP rather than being laid over one, so there is no row in `SCREENS` to hang
+them off and they were left to the callers — where they drifted exactly as the
+lid lists had: of the seven `go` call sites, `startRound`, `toggleEditor` and
+`enterMenu` took the card down, `endRound` replaced it, and `enterDeploy`,
+`spawnPlayer` and `enterDying` did neither. Offline that is invisible, because
+those three are only ever reached from a state with no card up. Online the wire
+decides the step, and a `spawn` arriving while the client was still building put
+the player in the world behind an opaque `BUILDING…` card.
+
+**What made it permanent rather than ugly is that `go` also clears `bakeWait`,
+and `finishBakeWait` is the only thing that ever hides that card.** Killing the
+wait and leaving the card were one line apart and were treated as two
+obligations; they are one. A step change under the card therefore ended the
+drain, skipped the hide, and left `updateBakeWait` — gated on `bakeWait` being
+non-null — unable to run again for the rest of the round: a full-screen card
+with `.overlaid` hiding the HUD under it, a live deploy screen behind it that
+nothing could reach, and no button on it that did anything (`onStart` guards on
+`menu`/`roundover`, and the state had moved on). So `go` hides `#overlay` in the
+same breath as it clears the wait, and **a caller that wants a card up raises it
+AFTER its own `go`** — `startRound` and `endRound` both do, and re-showing over
+a hide is one class write rather than a flicker, because nothing renders in
+between.
+
+**The client's own half of a deploy ask has the same shape and is cleared in
+the same spirit** — `NetSession.pendingDeploy` on a `roundstart`. A request
+stands until the authority answers it, which is what lets it survive a socket;
+a rotation is where standing stops being true, because `NetPlayer.retire` drops
+the authority's `deployRequest` across one and the index names a spawn on a map
+nobody is playing any more. Left standing, a reconnect's `flushDeploy` re-sent
+it, the authority resolved a stale index by picking a spawn itself, and the
+`spawn` event came back into whatever state the client's rebuild had reached —
+which is precisely how the stranded card above was reached in a real match.
+
+## Pausing, and the netplay inversion
+
+Pausing is just `tick` not calling `updateGameplay` — everything else still
+renders, so the round reads as held rather than gone — plus two things that would
+leak past it: `Sfx.setSuspended` stops the audio clock (the tail of the last shot
+is still there on return, and the voice counter stays honest because nothing ends
+while the clock is stopped), and the HUD is ticked with `dt = 0` so the killfeed
+and toasts freeze with the world instead of fading off a frozen screen.
+
+**Both of those invert under a NETPLAY lid, because there the game is not
+held.** The authority never heard the key, so every lid declares `roundBehind`
+and `Game.updateRoundBehind` — called once from `tick`, before the switch, for
+whatever is on screen — steps the netplay frame and the gauges as the deploy
+screen draws them, plus the reinforcement clock when the deploy screen is what
+the stack is over, since that clock is the round's and the server runs it down
+regardless. The HUD keeps its real `dt` (kills arrive while the card is up), and
+the audio clock is left running: a suspended context would not play the wire's
+`hit`/`damage`/`explode` cues *or* let them end, and the whole pause-worth of
+them would sound on the resume. **The question is never which screen is up, but
+whether what is under it is moving** — `holdsWorld` and `roundBehind` in the
+table are that question asked once per screen, `Game.worldHeld` adds the one
+thing the table cannot know (is there a session at all), and a new screen over a
+round cannot fail to answer.
+
+It is called before the switch rather than after it because `dt` is time that has
+already passed, and the screen that was up while it passed is the one the frame
+belongs to. The states that are IN the fight answer `false` — `updateWorld` steps
+that same frame already, and a second answer here would step it twice.
+
+**The same inversion decides who may START a round, and there `roundover` is the
+state that gets it wrong on its own.** Offline the round-over card is a menu: the
+player asks for another one and `startRound` gives it to them. In a match it is a
+WAIT — the authority holds the result up for `ROUND_OVER_MS`, builds the next map
+and says so with a `roundstart` — and a client that started its own round there
+disposed the `GameMap` under a live match, offered a deploy screen for a round
+nobody else was in, and sent a `deploy` the authority threw away (`onDeploy`
+refuses a living player, and a rotation's `retire` clears the request of a dead
+one), leaving the card on "Deploying" with nothing coming back. It recovered when
+the real `roundstart` landed, which is the only reason it read as a stutter
+rather than a hang.
+
+**There were three doors into it and the widest was a key.** `updateMenuCard`'s
+confirm tail fires on Enter, pad A and Start for both cards it draws; the
+round-over card's own `ov-start` button is the second; the pause menu's "Restart
+round" is the third. All three now ask `!this.net`, and the two that are drawn ask
+it in the DRAWING as well — `showRoundOver` and `showPause` take a `solo` flag, so
+in a match the button is ABSENT rather than dimmed and the card says the server is
+choosing. The handler guards stay because the markup is what a handler is bound
+to and the markup outlives none of these transitions. The keyboard door is the one
+that was actually being fallen through: the kit screen closes on that very key,
+and when a round ends under it the round-over card arrives beneath the player's
+fingers.
+
+## The pointer lock
+
+**Losing the pointer lock is the trigger, and it has to be.** Escape belongs to
+the browser — it is the UA's gesture for dropping the lock and the keydown behind
+it is not reliably delivered — so `Game` pauses on the *transition* out of the
+lock, which also covers alt-tab and any focus loss. A player who never took the
+lock (a pad player) has none to lose, hence the transition test rather than a bare
+"not locked". `Escape` and gamepad Start are the second trigger, through
+`input.pausePressed`; Start also raises `confirmPressed` (it is the menus' deploy
+button), so the paused branch handles pause first and breaks. Gamepad **B** resumes
+(`menuBackPressed`). The list is confirmed with `menuConfirmPressed` — Enter and
+pad A but *not* the mouse — because a click on the empty half of a pause screen is
+not a menu choice.
+
+**Re-taking the lock on resume is deferred, retried, and never pauses on its own
+failure** — the one key that ends a pause is the one key the browser reads as
+"drop the lock", so asking for it back in the same breath loses three ways.
+Chrome refuses outright for about a second after an Escape-exit; a lock granted
+while Escape is still down is taken away again by the key's auto-repeat; and
+that revocation arrives as a `pointerlockchange` the pause trigger would read as
+a player leaving, putting the menu back up a split second after it was
+dismissed. So `resume` only *marks* the lock as owed, `updatePendingLock` waits
+for the key to come up and then asks on an interval until the lock lands or the
+window runs out, and a loss inside `CONFIG.input.lockGrace` of taking it is read
+as a refusal rather than a departure. If the browser holds out, the round is
+still running with the CLICK hint up and the next click gets it.
+
+## What the pause card is on screen
+
+`#hud.paused` is deliberately **not** `.overlaid`: the menu and round-over card
+hide the gauges because what is under them is last round's, while under a pause the
+tickets, flags and vitals are current and frozen with the scene. It hides what
+would be lying — hitmarker, damage arcs, capture panel, mouse hint. It is also the one
+overlay taking pointer events across its whole area, because the deploy screen
+underneath takes them too and a click through the backdrop would land on its map or
+Deploy button.

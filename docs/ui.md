@@ -1,0 +1,1326 @@
+# The interface: five screens and the chrome
+
+What each UI class owns, where a stylesheet lives, and how the screens between
+the title and the world are driven by a pointer and a pad alike. Split out
+of [`CLAUDE.md`](../CLAUDE.md), which keeps the summary; this file is the
+contract for everything under `src/ui/`.
+
+## The interface is five screens and the chrome
+
+`src/ui/` holds one class per thing on screen, and `HUD` is not where a new one
+goes: `OverlayScreen` owns the four full-screen cards, `DeployScreen` the deploy
+map, `LoadoutScreen` the kit, `SettingsScreen` the settings list, `LobbyScreen`
+the match browser, `Minimap` the corner map, and `HUD` **only** the gameplay
+chrome. `TouchControls` is in the directory and is deliberately not in that
+count — it draws like a screen and answers like a gamepad; see the last section
+here.
+
+## The shell
+
+**Every screen between the title and the world is drawn in one frame, and the
+frame is anchored to the VIEWPORT rather than centred in it.** `.ui-screen` in
+[`base.css`](../src/ui/base.css) is three grid rows — a head, a body, a foot —
+with fluid gutters: the head carries the screen's name on the left and a meta
+slot on the right under a hairline, the foot carries the input hints and the
+way out along the bottom edge, and the body takes everything between them.
+
+What it replaced is the reason it exists. Every one of these screens used to be
+a ~600 px column floating in the middle of the window — `--col` on `#overlay`,
+a 680 px `.se-panel`, a 640 px `.lb-panel`. On a 2560-wide monitor that is a
+quarter of the width in use and nothing within 500 px of an edge, which is what
+makes a screen read as a dialog box laid over a game rather than as the game's
+own front end. The head and the foot now run to the glass; `--ui-max` (1680 px)
+caps the BODY, so an ultrawide gets a wide composition rather than a stretched
+one. That split is the whole trick — the chrome touches the edges, the reading
+matter does not.
+
+**The body is a LIST and the PANEL that says what the list's cursor is on.**
+`.ui-rail` is the list column and `.ui-panel` the one beside it, and the second
+is what turns leftover window into a reason to have it: which map, drawn and
+described; which enemy, and what that tier is like to fight; what is in your
+hands and what it does. A wide screen that puts the same six rows in the middle
+of more emptiness has not used the space, it has just left more of it.
+
+`.ui-panel` is an OPEN column with a rule down its edge, not a box. It was a
+chamfered plate first and the plate was the wrong shape: the panel is full
+height because it is one side of the screen, while what it holds runs from four
+lines to a schematic — so on the short rows a box read as an oversized empty
+container. A screen that wants a plate adds `.frame` and the rule steps aside.
+
+**Everything is sized in `clamp()` over `vmin`, and the reason is the phone.**
+A menu drawn at one size and scaled down is a miniature of a desktop layout:
+right proportions, unreadable type, a title bigger than the list under it. Sized
+fluidly, the same markup is a phone layout at 390 px tall and a cinema layout at
+1440. `vmin` rather than `vw`, because an ultrawide is short for its width and a
+title scaled by width alone on a 2560x1080 is taller than the rows it heads.
+
+**One column when there are not two columns' worth of room**, keyed on width AND
+on aspect — a narrow window has no room for a panel beside a rail, and a nearly
+square one has room and no HEIGHT to spend on stacking. The panel GOES rather
+than shrinking (`.ui-optional`), because half a panel says less than none and
+takes the rail's room to say it. `--ui-lean` is the same pair of queries as a
+custom property, for the screens that drop optional matter of their own.
+
+**The MENU has a threshold of its own, and it is the only screen that does.**
+900 px is the width below which a rail and a panel stop fitting on the settings
+screen and the lobby; the menu's rail is wider than either, carrying a map's
+name at 22 px between two arrows, four tier buttons that have to stay readable
+words, and three openers with a caption on each. At 1024 px — a tablet held
+upright — the shell's rule still says two columns and the rail gets 383 of
+them, which is `HOLLOWM…`, `RECR…`, `REGU…`, `VETE…`: the ellipsis the map
+stepper was built to remove, arriving from the layout instead of from the
+picker. So `#overlay.card-menu` drops to one column at **1100**, and the number
+is what its widest row measures rather than anything about a device. A screen
+that grows a wide row owes the same arithmetic; a screen that does not stays on
+the shell's.
+
+**And it is the one screen that puts its panel BACK on an upright viewport.**
+Dropping the panel is right because a narrow window has no room BESIDE the
+rail — and a phone or a tablet held upright has no room beside it and a great
+deal under it, which the shell's rule left as four hundred pixels of nothing
+below the Deploy button. Under `(orientation: portrait) and (min-height:
+700px)` the menu's body becomes two ROWS and the dossier is the second. Two
+rules make that safe rather than merely possible. **The panel's row is
+bounded** (`minmax(0, 1fr)`, `overflow: hidden`): sized `auto` under a rail the
+dossier is as tall as whatever is in it — 399 px on a 390-wide phone, 608 on a
+tablet — and runs off the bottom of the viewport and under the foot, since
+nothing in this HUD scrolls. And **the SCHEMATIC is the first thing out of that
+budget, not the last**: it is the best thing on the dossier and it is also
+220 px square on the phone that has 212 px to give the whole panel, so a phone
+gets a head, a clamped line and the figures, and the schematic waits for
+`min-height: 1000px` — an upright tablet — where it can be drawn at a size
+worth drawing. A 60 px map of Cinderhaven is not a smaller schematic; it is a
+grey square where one used to be.
+
+**A screen over another SCREEN is opaque; a screen over the SCENE is not.**
+`.ui-veil` is the backdrop — a warm glow off the lower-left corner and a cold one
+off the upper-right (the friend/foe pair the whole HUD is coloured by, and what
+gives the frame a direction to be lit from), a vignette, a diagonal hatch, and
+the scanlines every card here already had. The menu, the round-over card and the
+deploy screen stand over a live 3D view and let it through. The settings list and
+the lobby stand over the MENU — DOM over DOM — and add `.ui-solid`, which closes
+the vignette: a veil tuned to let a village through lets a wordmark and a rail of
+buttons through with it, which reads as two screens up at once.
+
+**`--ov-scale` is a safety valve now, not the layout.** It is still the mechanism
+described further down — draw the screen at the size it was authored for and
+scale it down — but the fluid frame fits the viewport it is given, so the ladder
+is 1 until a viewport is shorter than anything the clamp minimums fit in
+(380 px), and gentle when it does engage. At the old 0.45 a landscape phone got a
+legible desktop menu rendered at 45%. Raising it back toward those numbers undoes
+the responsive layout wholesale.
+
+**The kit screen carries the head without the frame**, and it is the one
+exception. Its middle is a hole the 3D turntable is placed through, so it
+declares a grid of its own — head band, weapon strip, three columns, foot band —
+and takes `.ui-head` and `.ui-foot` as full-bleed rows in it. Both bands are
+above the hole rather than across it, which is what `.ui-screen`'s own grid
+could not have arranged. That is why the title rule is scoped to `.ui-head`
+rather than to `.ui-screen`.
+
+**The boot screen is the one piece of interface that is not in this directory**,
+and the exception is what defines it: it covers the stretch before any module
+has evaluated, so `src/ui/` could not draw it — the bundle it would be drawn by
+is what the player is waiting for. It is markup in `index.html` with its styles
+in that file's `<style>` block, and `main.ts` is the only code that touches it:
+taken down two frames after the `Game` constructor returns, or turned into one
+of the three failure messages when the game cannot start at all — "needs
+WebGPU", "no graphics device" or "no physics engine". It is self-contained
+by necessity — in DEV `base.css` is injected from JS and has not arrived either,
+so it may not use `--font`, `.frame`, or anything else the interface shares.
+Nothing that reacts to game state may be added to it; that is an interface, and
+it belongs here with a stylesheet of its own.
+
+Each screen builds its own root element and appends it to `#hud`, which is why
+construction order in `Game`'s constructor matters exactly once: `HUD` writes
+`#hud.innerHTML` and would wipe anything already appended, so it is built first.
+Stacking is not DOM order — `#overlay` (10), `#loadout` and `#lobby` (11) and
+`#settings` (12) carry z-indices, because a pause can be taken with the deploy
+map on screen. The kit and the lobby share a rung on purpose: both are lids
+raised from the main menu and the two can never be up together.
+
+**A list-shaped screen keeps its cursor by IDENTITY, not by index.** The lobby
+is the one whose rows come and go under it — a refresh inserts matches ABOVE the
+actions — and an index carried across a rebuild silently means a different row:
+press Refresh, let a match appear, press Enter and you have created a match
+instead, with the highlight having moved under your hand to say so. `sameRow`
+matches an action by kind and a match by id, never by anything that changes
+(a count going 3 → 4 is the same row). The settings screen is spared this only
+because its rows are a static table.
+
+**A row that PICKS is not a row that FIRES, and the pointer has to tell them
+apart.** The lobby's rows fire on pointer-DOWN — that is the edge everything
+which leaves a screen uses — but its Map row only steps a choice, and the map
+buttons inside it take ordinary clicks on the way UP, exactly as the menu's own
+map and difficulty rows do. Firing the row on the down edge as well would cycle
+the choice under the finger and then set the clicked one, which lands in the
+right place by luck and flickers getting there. The row is above **New match**
+rather than below it for the reason the menu puts Map above Deploy: the
+parameter, then the button that spends it. It is the map a match this client
+CREATES will be started on and says nothing about the matches listed above it —
+see [`docs/multiplayer.md`](multiplayer.md) for why joining one takes that
+match's map instead.
+
+**THE WAY OUT OF A SCREEN IS A BUTTON IN ITS FOOTER, never a row in its own
+list.** The settings screen, the kit screen and the lobby all end on the same
+line — what the keys and the stick do, then Back at the right-hand end of it —
+and it is `.ui-foot` / `.ui-back` in `base.css` rather than three copies, so a
+fourth list-shaped screen gets the whole convention by naming it. The lobby's
+Back was a row for a while and it was the wrong shape twice over: it sat under a
+list whose length is whatever the servers happen to be running, so the one
+control every visitor eventually wants was the one whose position nothing could
+predict; and it wore the same highlight and the same Enter as *join this match*,
+when leaving and joining are not the same kind of act. The pad and the keyboard
+never needed the row — Esc and B leave all three screens through `Game`, which
+is what the chips on the button say — so what it cost a pointer to reach was the
+whole of what it bought.
+
+The label is **Back** on all three, including the kit screen, which said "Done"
+until this was shared. Every one of them applies a pick the moment it is made,
+so there is nothing on any of them to be finished with, and two screens that
+leave the same way must not use two words for it. Where the keys genuinely
+differ, the screen's own hints say so: Enter changes a settings row and closes
+the kit screen, and only the pair that works everywhere is on the button.
+
+**The four cards are one class because they are one element** — they share the
+shell, the title block and the Deploy button. The bar for a screen of its own is
+*state*: the deploy map has a selection and a canvas, the kit screen has four
+slots and a turntable; a card that is markup plus a button has not earned one.
+
+**Three of the four take the screen and the PAUSE does not.** `setCardClass` is
+what decides it: the menu, the round-over card and the building card get the
+frame and the veil, and the pause gets a left-anchored column over a scrim that
+fades out before the middle of the window. The round under a pause is this
+round, frozen where it stood — the flag strip along the top, your own vitals,
+the body you were lining up — so a full-bleed veil over it hides the thing the
+pause is *in*. It is the same argument that keeps `setOverlaid` out of
+`showPause`, stated as a layout instead of as a class. The list is on the left
+because that is the side a pause menu has been on since consoles had two sticks,
+and because the middle of the screen is where the shot it interrupted was being
+lined up.
+
+**The building card is the one that stays centred and bare**, and the freeze it
+covers is why. Everything on it has to be PAINTED before the main thread stops,
+so a panel with a canvas in it would be a schematic drawn on the frame the
+player was already waiting through. A name, a word, and a bar.
+
+**The key-cap table is no longer one of the things they share, and that is the
+whole reason it moved.** It hung under the menu's title and under the pause list,
+drawn from one table by one loop, which was right while the settings screen was
+two toggles no pad could reach. Once that screen became a list a cursor lands on
+from both places, the table belonged in it: the menu is five decisions and a
+Deploy button, and eleven rows of reference under them made the longest block on
+the card the one nobody reads twice. It is one row of the menu and one item of
+the pause list away, and the settings screen opens on the page that carries it.
+
+**The building card is the fourth, and it is the only one the player cannot
+act on.** It stands over the ~0.7 s of merges, occlusion bake and nav grid that
+building a map costs, and it exists because a freeze and a load look identical
+from the outside — before it, the card the player had just confirmed simply
+stopped where it stood for the whole build. `Game.startRound` is what actually
+buys it the frame it needs to be drawn in; see the state machine's `loading` in
+[`CLAUDE.md`](../CLAUDE.md), and note that the rule there is **two**
+`requestAnimationFrame`s, not one. It takes itself down at the end of
+`Game.buildRound` rather than waiting to be dismissed.
+
+**Its bar may only be animated with `transform` or `opacity`** — the one place
+in this directory where the choice of animated property is a correctness
+constraint rather than a matter of taste. For the whole life of that card the
+main thread is inside the build, so nothing on it can move unless the
+COMPOSITOR can move it alone, and the compositor only takes an animation that
+needs neither layout nor paint. A bar animated on `width` or `left` renders
+perfectly in every test and then stands still for the one second it exists for,
+which reads as a hung game rather than a loading one. Measured: with a 5 s
+block forced, the bar keeps producing distinct frames throughout and drops
+none. The bar is also **indeterminate**, and honestly so — the work behind both
+it and the boot screen's is a single uninterruptible call, so there is no
+progress to read even in principle, and an invented percentage always ends up
+stuck at 90 while the real work finishes.
+
+**The settings list is a ROW TABLE, and every row is the same thing: a labelled
+choice over one field of `Settings`.** A toggle is a two-option choice, so Off/On
+and a three-rung resolution ladder go through one renderer, one key handler and
+one hit-testing path. What a longer list changes is only how the cell is DRAWN:
+the control column is fixed, which is ~60 px a button for three options and 10 px
+for sixteen — narrower than one character — so a row can ask for
+`style: "slider"` and be laid along a track instead.
+
+**It is split into PAGES, and the page selector is ROW 0 rather than a key of its
+own.** That is the whole tab mechanism: up and down reach the row, left and right
+step it, Enter wraps it — exactly what every other row on the screen already
+reads, so a pad needs no bumper nobody would think to press and the screen needs
+no second hit-testing path (the tabs are `.se-opt` buttons like any short option
+list). It is not in `Settings` and not in a page's rows because what it changes is
+on this screen rather than in the store. Switching pages puts the cursor back on
+the selector: row 3 of Display is not row 3 of anything else, and the row the
+player is standing on is the one they just used. `show()` resets the page as well
+as the row, for the reason the kit screen resets its cursor — and because a
+screen that opens on Display because that is where you were last week hides the
+key table from the player who came looking for it.
+
+**A page is what this list GROUPS by, and it replaced a heading row for a reason
+that is about height.** Nothing in this HUD scrolls, so a list that outgrows its
+panel does not get a scrollbar, it gets a foot the player cannot see. A heading
+buys an inch of separation and spends the same height as a row; a page buys the
+whole rest of the list back. The split rule is the mechanical one — a page that
+outgrows the panel splits into another page, exactly as a section would have
+split into another heading.
+
+**The key-cap table is the one thing on the screen that is not a choice, and it
+is in the PANEL beside the list rather than under it.** It carries no
+`data-row`, so the cursor steps straight past it — it is not a row, it is what
+the Controls page is *about*. Eleven rows under a list of three sliders was the
+longest block on the screen and the thing that decided the panel's height;
+beside that list it costs it nothing. Its own three columns (action / keyboard /
+pad) are set independently of the list's, because an action name is short where
+a setting's label is long and matching the two would leave the key chips
+stranded mid-panel with the pad column adrift at the far edge.
+
+**The row HINT moved into that panel with it, and the list is two columns now.**
+A hint is a sentence of prose, and it was in a cell as wide as a control, set at
+10 px, clipped whenever the panel narrowed. One row's hint at a time, given a
+column of its own, is both more of it and less of it on screen: the row you are
+standing on gets a heading and a readable line, and the four you are not stop
+competing with their own controls for width. The page selector is answered there
+like any other row, which is the same argument that made it a row at all.
+
+**The Display page's panel carries a `facts` block instead of a table**, and it
+is a function rather than a string because every figure in it is measured when
+it is drawn — the window, the pixel ratio, what the ladder above actually comes
+to on this machine. A settings screen reporting the size the window was when the
+bundle loaded is worse than one reporting nothing. It is also what keeps that
+page's panel from being a heading and one sentence in a column the height of the
+screen.
+
+**A viewport too narrow for the panel gets the hint back as a third column and
+loses the key table**, and that is the right thing to lose. A window that narrow
+is a phone held sideways; the table names a keyboard and a pad, and the game on
+that device is played with the touch controls, which are drawn on screen and
+name themselves.
+
+- **The slider is positioned by option INDEX, not by value**, one rung per equal
+  share of the track. That is what keeps it a choice over the same `options` the
+  arrow keys step and the same list a codec validates against: a drag cannot land
+  on a value a keypress could not reach. It also preserves a ladder's spacing —
+  `CONFIG.camera.lookScales` is geometric, so an inch of drag is the same *ratio*
+  of look speed wherever it is taken.
+- **The drag lives on the WINDOW and its geometry is captured at the press**,
+  because `draw` rebuilds `innerHTML` wholesale: the element under the finger is
+  destroyed and replaced the first time the value crosses a rung, and a listener
+  or a pointer capture bound to it dies one rung in. The track's box is measured
+  once — nothing about the row's layout depends on the value — so a drag survives
+  the redraw, leaving the row, and running off the end of the screen.
+- **The thumb's size is declared in CSS and read back off the DOM**, never
+  restated in the script. Both the paint (`left: calc(var(--t) * (100% -
+  var(--thumb)))`) and the hit maths need it, and two copies of that number are
+  two things that drift into a thumb sitting where the value is not. The script
+  writes `--t` and nothing else.
+- **Hover does not move the selection while a slider is held.** The redraw a drag
+  causes lands a fresh row under a pointer that has not moved between rows, and
+  taking the selection from it would walk the highlight onto a slider the player
+  is not dragging.
+
+**A hint says what the value WORKS OUT TO, and that is why hints are computed
+rather than written in the table.** "75%" and "1.25x" are both numbers over
+something the screen never shows — a panel's pixel count, a rate in radians —
+so `hintFor` resolves each against the machine (`1280x800`) or against
+`CONFIG.camera` (`202° per 1000 px`, `160°/s at full stick`). A player comparing
+this game against the shooter they came from is comparing sweeps, not
+multipliers.
+
+**A class on `#hud` belongs to whoever raises it.** `OverlayScreen` sets
+`.overlaid`, `LoadoutScreen` sets `.kitting`, `HUD` sets `.paused`, `.editing` and
+`.dying`. That is why a pause is two calls from `Game` rather than one: the card
+goes up and the HUD's own aiming chrome comes down, and they are not the same
+decision — `.overlaid` would take the tickets and vitals with it, which under a
+pause are still true.
+
+**The scoreboard is the one markup rebuild left in `HUD`, and its rows are BUILT
+rather than interpolated.** Tab is a held key, so `Game.updateHud` pushes the
+panel on every frame it is up; a key over everything the markup says is what
+keeps that to a rebuild per change, and the per-body rows are in that key
+because a kill anywhere reorders the column it lands in. The team summary is a
+template literal — a map name and two names out of `CONFIG` — while every row
+under it goes through `document.createElement` and `textContent`, because one of
+its fields is **a name another player typed**. The server bounds that string's
+length; nothing bounds what is in it, and this file is where it is finally
+drawn. A bot's name is not on the wire at all: `entities/callsigns.ts` derives
+one from the roster index, which is the same number on every screen.
+
+**The ping column exists only in a match, and whether it does is TOLD rather
+than derived.** Offline there is no server to be any distance from, so the
+column is not there at all — a fourth grid track added by a class on the panel.
+In a match it is there from the first frame, because the authority's first table
+arrives a second into the round and a column that grew when the first number
+landed would reflow every name on the board under a player already reading them.
+A body with no connection behind it (every bot, and a peer whose first ping has
+not come back) gets an em dash and never a zero, which would read as the best
+connection in the round. The number and the band its colour comes from are
+`ui/ping.ts`, which the lobby's own reading also goes through — the same
+connection is measured on both screens, and a player told "fine" on one and
+"poor" on the other at the same number learns to trust neither.
+
+**It is pushed from `tick`, in every state with a round behind it** — playing,
+the death cam, and the DEPLOY SCREEN, which is where a player most wants it: in
+a match that screen is where you sit out every reinforcement clock while the
+round carries on without you. The push is one line after the state switch and
+before the render, so the state a frame ENDS in decides, and the six ways out of
+a round no longer each owe a `setScoreboard(false)` — the one that forgot would
+leave the numbers hanging over the next screen. It goes away under a lid
+(`paused`, `loadout`, `settings`) because a lid is a screen the player asked
+for. `#scoreboard` carries a `z-index` for exactly one reason: every screen
+appends itself after `#hud`, so DOM order alone would bury it under the deploy
+screen it is meant to be read over.
+
+**Your side is the LEFT column, whichever side you were seated onto.** A board is
+read from where the reader is standing, and a column that changes ends between
+matches is one a player has to find before they can read it. The rows are sorted
+by SCORE, then by kills, then by fewer deaths, on a stable sort, so bodies level
+on all three keep roster order instead of trading places while somebody is
+looking at them.
+
+**Score leads the row, and that is the reason the column exists.** A round is
+won on flags and lost on tickets, so the player who took three of them has done
+more for the win than the one with four more kills — and a board ordered by
+kills says the opposite in the one place everybody looks. The number is the
+`ScoreBook`'s (`config/score.ts` is the table it spends), the team's own total
+is drawn in that team's colour because it is the summary of the whole round, and
+the figures are tabular because a sorted column of proportional digits does not
+look sorted. The panel's `min-width` grew with the column: `#scoreboard` is
+inside `#hud` and so is NOT scaled by `--ov-scale`, which makes that width a
+promise to the shortest viewport the game runs on.
+
+**The score FEED is where a player actually learns the scoring system**, and it
+is a separate thing from the board: the board is behind Tab and shows a total,
+while the feed says "+250 CAPTURE" at the moment the flag flips. One line per
+award, so a headshot on an attacker in your own zone is three of them stacked —
+that itemisation is the feature rather than a side effect, which is why the
+authority sends one `score` event per award instead of a total. It is anchored
+by its BOTTOM edge over the ammunition column, so the newest line sits still and
+the older ones ride up off it; a top-anchored stack slides the line the player
+is reading downward every time another award lands. It lives on the right
+because that is where the HUD's numbers already are — centre is `#message` and
+`#capture-status`, and anything that moves in the middle of the screen reads as
+something to shoot at. `HUD.LABELS` is a total map over `ScoreKind`, so a new
+award in `config/score.ts` does not compile until this file has decided what to
+call it.
+
+**`#capture-status` is UN-PANELLED, and it was the last piece of gameplay
+chrome that was not.** It said which side of a capture boundary you are standing
+on from inside a chamfered plate with a border and a near-opaque fill — the one
+thing `base.css`'s house rules name outright as what makes a HUD look like a web
+page, and `#hud-bottom` gave up for exactly that reason years earlier. This one
+kept it longest because it sits in the middle of the screen where a player
+cannot look away from it, which is the argument for the plate and, once it is
+written down, the argument against. What replaced it is a soft radial scrim with
+no edge anywhere in it: the same legibility over a lamp-lit street or bright
+sand, and because it has no boundary it reads as the screen darkening under the
+words rather than as a box laid over the village. The three lines carry the
+hierarchy the plate was standing in for — the zone loud, the meter watched, the
+state a caption under it — and the meter is skewed and segmented at the vitals
+bar's own proportions, because two meters on one HUD drawn to two ideas read as
+two different games.
+
+**Nothing on that element may carry an ANIMATION, and the reason is one line in
+`setCapture`.** The panel's className is rewritten on every whole percent the
+meter moves, a className write restarts every animation on the element, and the
+contested pulse used to live there — so it ran its first frame several times a
+second and never got any further. It is on `.cap-state` now, whose only write is
+a text node, and what it pulses is OPACITY for `#outbounds`'s reason: motion is
+what the eye catches while its owner is being shot at, and a hue change is not.
+The state line is also `nowrap`. The longest string it can hold is a contested
+zone on Sarab, where `MapLayout.perTeam` bounds the count at 24, and a second
+line would move the meter and the name into the middle of the screen every time
+the number crossed the width.
+
+**`#outbounds` is the one thing on the HUD that is the map's EDGE**, and it is
+the loudest thing the chrome draws for exactly that reason. On the three maps
+closed by the rim it never appears: there is a wall and the player is standing
+against it. On one with a `MapLayout.borderland` there is no wall, no rock and
+deliberately no invisible barrier to bump into (see [`docs/world.md`](world.md)),
+so this panel IS the boundary, and a player who does not read it dies of
+something they never saw. It sits at 13% — above `#message`'s 24%, because both
+can be up at once when a flag falls while somebody is walking off the map — and
+`Game` pushes it from `updateHud` beside `setCapture`, null while dying.
+
+Two decisions inside it. The count is dark red from the FIRST second rather than
+turning red at the end, because a warning that reads as advisory for six seconds
+and as an emergency for four spends the six a player could still act on; what
+`.urgent` changes is the RATE it pulses, since motion is what the eye catches in
+peripheral vision while its owner is being shot at and a hue change is not. And
+the count is rounded UP and written once a whole second, so it opens on the full
+ten and shows a 1 only while there is genuinely under a second left.
+
+**The minimap is PLAYER-CENTRED and HEADING-UP, and everything else about it
+follows from that pair.** It used to be the whole map, north-up, matching the
+deploy screen — which was a fair picture of a 240 m village and a useless one of
+a 400 m vale, where a barn was two pixels and the five flags sat inside the
+middle third. Now `CONFIG.minimap.viewRange` metres reach the mid-edge of the
+canvas, the player is nailed to the centre, and the world turns under them, so a
+bearing taken off the map is the bearing the picture above it is already
+showing — the reason the arrow points up and never anywhere else.
+
+Three things are owed for that, and each pays for a thing the old view got for
+free. **NORTH**, which a turning map spends: the frame's mark is no longer a
+static `N` but the heading the top of the canvas is pointing at, drawn `↑ NE`,
+and it sits OUTSIDE the canvas in the gap above the frame because the rim inside
+now carries lettered markers of its own. **The OBJECTIVES**, which a zoomed map
+stops showing and which are the only reason to look at one: every control point
+off the drawn square is pinned to the rim on its own bearing, carrying its
+letter, its owner's colour and the contested pulse, so the way to the next flag
+is always on screen. The rim it is pinned to is the SQUARE's and not a circle
+inscribed in it — the corners are drawn map like anywhere else, and a circular
+rim would post a marker for a flag the player can already see sitting in one.
+And **the player's own arrow needs no clamp any more**: it was clamped because a
+borderland let its owner stand eighty metres off the bitmap, and a canvas clips;
+now it is the one marker with no arithmetic behind it at all.
+
+**The PLATE is translucent and the SHAPE is the canvas's, and those two are
+one decision.** The map used to paint an opaque rectangle over the village with
+its chamfer clipped in CSS and its edge drawn as a solid layer showing a pixel
+proud behind it — the `.hull` trick every chamfered panel in the interface uses.
+Thinning the plate breaks that outright: an edge layer BEHIND a see-through
+canvas is a lit rectangle rather than a line, and a CSS background under one is
+the opaque square the plate stopped being. So `Minimap.ts` owns the shape now —
+it clips the two-cut chamfer and strokes the hairline in canvas pixels, the CSS
+box and the backing store already being the same size — and `minimap.css` is
+left positioning the box and styling the compass. What that buys is the same
+thing `#hud-bottom` and `#capture-status` buy: legibility from a scrim rather
+than from a panel, and a map that sits IN the scene instead of on top of it.
+
+**Everything drawn inside it is drawn in the HUD's own face**, read off the
+element once with `getComputedStyle` rather than restated as a stack. Canvas
+takes a font as a string and inherits nothing, so the flag letters were the
+browser's UI face sitting in the corner of an interface set entirely in
+`--font` — the one thing on this map that was not the same piece of software as
+the rest of it.
+
+**What the backdrop stops at is the PLAY SQUARE**, and on a map with a
+borderland that edge is worth the pixel it costs — it is the line the leash is
+counting its owner down against, so the ground past it is painted a duller tone
+and the square's own border is stroked into the prerendered image. The backdrop
+is prerendered at the SAME pixels-per-metre the canvas draws at, so turning and
+scrolling it is a 1:1 blit and nothing blurs; that makes it as many pixels
+across as the play square is metres times that scale — 733 px on Harrowmead's
+400 m — which is why the scale is a fixed number and not something a zoom
+control moves.
+
+**The magazine strip is markup the WEAPON TABLE sizes**, and it is the one place
+a number in `CONFIG.weapons` reaches the DOM. `HUD.setAmmo` builds one `<i>` per
+round in the carried weapon's magazine — the count is what makes the strip
+readable without reading the number — so the row's length is a weapon's
+`magSize` and a new weapon can make it any width it likes. The box is therefore
+FIXED at the health bar's 224 px and the ticks are fitted into it: the pitch
+gives way, never the count, and never the strip's own width, which would
+otherwise redraw the right-hand column every time the kit changed. Ticks keep
+their authored 5 px until a magazine is bigger than 32 rounds; the LMG's belt of
+75 is what closes them up.
+
+**Past a 3 px tick the strip takes a second ROW rather than closing up further**,
+because 75 rounds in one row is a 2 px tick behind a 1 px gap — a bar with a
+texture, which is the one thing the strip exists not to be. The threshold is that
+measurement and not a round number, so a future magazine earns the row by being
+unreadable without one; today only the belt qualifies, and the SMG's 34 still
+draws as one row. The second row is paid for out of the tick's HEIGHT, inside the
+same 13 px box, or the ammo count and the weapon label under it would move every
+time the kit changed — the whole point of fixing the box. **The rows are filled
+by COLUMN, not by line**: consecutive rounds are the top and bottom of one
+column, so the lit fraction of the strip is still the fraction of the magazine
+left, which is the reading every one-row weapon gives and the only reason a
+second row is allowed at all. Filled by line, the top row would stay full until
+the belt was half gone.
+
+**The stowed slot is the only thing on screen that says the second weapon
+exists.** Everything else in the bottom-right corner describes the weapon in
+the hands — the viewmodel shows one gun, the big count counts one magazine, the
+strip is one magazine's ticks — so a player who never pressed the swap key had
+nothing telling them there was a key to press, and a sidearm nobody knows about
+is a sidearm nobody draws when the rifle runs dry. That is the whole of what it
+is for, and it decides how it is drawn.
+
+- **It shares the ammunition LINE rather than taking a row of its own**, at the
+  far left of it, in the space a two- or three-digit number was already leaving
+  empty. The line is spread across the same 224 px as the health bar, the strip
+  and the kit caption, so the second slot costs the corner no height and no
+  width — it is drawn in a hole that was already there. Two slots on one line,
+  the carried magazine shouting at the right end and the slung one murmuring at
+  the left, is the hierarchy stated as a layout instead of as a caption.
+- **Three parts, each at its own weight, and the KEY is the brightest.** The
+  group is not dimmed as a whole: the chip is the instruction and is drawn dark
+  on near-white to be read at a glance (a hint you have to squint at is a hint
+  nobody follows), the count is the fact you act on, and the name is only there
+  to say which weapon the other two are about. It gets **no strip of its own** —
+  a second row of ticks beside the magazine's is two instruments competing to be
+  read, and a count is enough for a weapon you are not firing.
+- **It carries a live count, not a capacity.** Each slot keeps its own magazine
+  ([`weapons.md`](weapons.md)), so what is slung is what you would be swapping
+  *to* — pushed every frame like the carried one, each write skipped while its
+  string has not moved.
+- **Two states raise its voice, and they are opposites.** `dry` is the slung
+  magazine being empty too, the mirror of `#ammo-mag.low`: a swap will not save
+  you. `ready` is there being nothing to fire in your hands (empty *or*
+  reloading) while there is here — the one moment in a round when the second
+  slot is the whole answer, since a draw is a third of a second where a reload
+  is one and a half. **`ready` is a handover, not an alarm**: the carried
+  readout already dims itself through a reload, so the stowed slot coming up as
+  that goes down reads as the corner pointing at the faster option, and it earns
+  no animation on top. Firing the last round starts a reload in the same call,
+  so "empty and not reloading" is a state the HUD would never get a frame of —
+  which is why `ready` counts the reload rather than excluding it.
+- **The name and the key turn over with the hands, through `Game.applyCarry`**
+  — the same push that moves the kit caption, so the two can never disagree
+  about which weapon is which. `Player.slungSlot + 1` is the digit on the chip,
+  which is the same one fact `drawSlot` and the `1`/`2` keys already share.
+
+**One stylesheet per module that writes markup, imported by that module**
+(`HUD.ts`→`hud.css` … `editor/EditorPanel.ts`→`editor/panel.css`); `main.ts`
+imports `base.css` first. Vite bundles them into one hashed stylesheet the built
+`index.html` links from its head. All of it was once ~2,050 lines inline in
+`index.html`, which cost three things worth not paying again: no compile-time link
+between markup and the rules styling it, so a renamed class was a silent visual
+break; the editor's ~170 lines shipped in every production build; and a CSS-only
+change moved no content-hashed filename. Three rules keep it that way:
+
+- **`base.css` is for what two or more screens share** — the reset, the canvas, the
+  `#hud` root, `.frame`, `.brackets`, `.hidden`, the `--ov-scale` short-viewport
+  block, `@keyframes pulse`, the kit button, the whole SHELL (`.ui-screen`,
+  `.ui-veil`/`.ui-solid`, `.ui-head`/`.ui-eyebrow`/`.ui-meta`, `.ui-body`,
+  `.ui-rail`, `.ui-panel`, `.ui-facts`, and the design tokens the five screens
+  are measured and coloured in), and `.ui-foot`/`.ui-back` (the hint line and
+  the Back button three screens end with). A rule only one screen uses
+  belongs in that screen's sheet however tempting the shared file is.
+- **A screen's state rules go with whoever sets the class**, not whoever owns the
+  element: `#hud.paused #deploy { opacity: 0.18 }` is in `hud.css` because
+  `HUD.setPaused` puts `.paused` on, even though `#deploy` is the deploy screen's.
+- **`index.html` gets no interface CSS, ever, with exactly two exceptions**, and
+  both are there because they are what the page shows while there is no
+  interface. The first is a black `html, body` background: a production build
+  links the stylesheet render-blocking from the head, but the dev server injects
+  it from JS, leaving one frame of default white — on a night game that reads as
+  a camera flash. The second is the boot screen's own block, for the same reason
+  one step further along. Neither may grow a rule that styles anything a module
+  writes, and nothing else may be added beside them.
+
+## The gauges' metric: one authored pixel, four rates
+
+The shell above is the SCREENS. The chrome — the minimap, the reinforcement
+gauge, the flag strip, the vitals, the ammunition, the killfeed, the driver's
+band — is a different problem with a different answer, and this is it.
+
+**It was authored in pixels for a 720p window**, and every number in `hud.css`
+still is: a 224 px health bar, a 46 px ammunition numeral, a 13 px magazine
+strip, a 220 px minimap. On a landscape phone that is roughly twice the chrome
+it should be, on about a fifth of the area to put it in. The two symptoms are
+the ones anybody notices first — the map is too big, and the readouts crowd the
+middle of a screen that has none to spare.
+
+**The fix is a UNIT, not a transform, and that distinction is the whole
+section.** `--hud-u` in [`base.css`](../src/ui/base.css) is one authored pixel,
+and every size in `hud.css` and `minimap.css` is stated as a multiple of it —
+`calc(224 * var(--hud-u))`. A transform was what this used to be (`--hud-touch`,
+on the bottom band and the minimap), and a transform can only do one thing to
+everything it covers: at the scale that brings a 46 px numeral down to a phone's
+size it takes a 10 px caption to six, which is not a caption any more. A unit
+can be several units, and the HUD's three jobs want three of them:
+
+| ladder | what it carries | floor |
+| --- | --- | --- |
+| `--hud-cap` | the micro-captions — VITALS, FRAG, the weapon's name, 8–13 px | 0.88 |
+| `--hud-mid` | the ticket counts, the flag letters, the centre message, the vehicle readouts, 15–28 px | 0.78 |
+| `--hud-num` | the two display numerals, health and ammunition | 0.66 |
+| `--hud-u` | everything that is a SHAPE rather than a word — bar widths, insets, gaps, pips | 0.62 |
+
+All four are `clamp()` over `vmin` against a reference of 800, so **a desktop
+and a laptop are untouched** — a 1366x768 window lands at 0.96 and a 1080p one
+saturates at 1 — and it is the phone the ramp is really for. `vmin` and not
+`vh`, for the shell's own reason: an ultrawide is short for its width, and a
+phone held upright is not a tall screen with room to spare.
+
+**`--hud-map` is the minimap and is a SIZE rather than a unit**, because it is
+the one readout whose cost is an AREA: 220 px is a tenth of a 1080p screen and a
+third of a landscape phone, which is why it is the first thing that reads as too
+big. `Minimap.ts` watches its own canvas and matches the backing store to
+whatever the stylesheet resolved to, so the map is REDRAWN at its size rather
+than resampled — see below.
+
+**The TRIM is the on-screen controls asking for the corner.** `#hud.touching`
+(`HUD.setTouching`, pushed per frame from `Game.pushTouchControls`) multiplies
+the ladder by 0.78, and the captions by 0.94 for the reason they have a rung at
+all. It is keyed on the CONTROLS being up and not on the viewport, which is the
+case no ladder above can cover: **a tablet** is tall enough that none of them
+has engaged and still has a 96 px trigger standing on top of its ammunition
+count. What it replaced hid nothing and still does — every gauge is exactly as
+true on a phone, and the band is laid out smaller rather than drawn smaller.
+
+Two rules for anything added to `hud.css`:
+
+- **State a size as a multiple of the ladder, never in bare pixels** — the one
+  exception below, and hairlines, rims and chamfers, which are a pixel because
+  a pixel is what they are.
+- **An INSTRUMENT is exempt, and the test is whether its size is a claim about
+  the screen.** `#gun-marker` is where the barrel points and `#hitmarker` is a
+  confirmation drawn at the point of aim. Neither is a design decision that a
+  smaller screen should scale, and both are left in pixels on purpose.
+  `#scoreboard` is exempt for its own reason, written down beside it: its width
+  is a promise to the shortest viewport the game runs on, and it already scales
+  the one case that cannot keep it.
+
+**THERE IS NO `#crosshair`, and the empty middle of the screen is the aiming
+model rather than a gauge that went missing.** This HUD draws nothing at the
+centre that is a claim about where the rounds go, because the game already has
+an honest instrument for that and it is not on the HUD: the sight fitted to the
+weapon, which `applyFit` cancels onto the very axis `CombatSystem` sends bullets
+down (`docs/weapons.md`). Hip fire is UNAIMED — `Player.spread` is still
+simulated and still reaches every round, it is simply not drawn, so a hip shot
+is a judgement about a weapon the player can see rather than a reading off a
+ring that opens and closes, and the third-person handover that used to fade a
+crosshair out as the sight came up has nothing left to hand over.
+
+There used to be one, and what it cost is worth stating so it is not rebuilt by
+halves: four ticks whose gap WAS the live spread in screen pixels, faded out
+against `adsBlend` because two aiming marks stacked on each other read as a
+smear, hidden by `.mounted`, `.overlaid`, `.paused`, `.dying` and `.editing`
+because in each of those it would have been lying, and pushed a frame at a time
+from `Game.updateHud` off a viewport height cached by the resize handler. **The
+two marks still drawn at the centre are exempt because neither is an aim** —
+`#hitmarker` reports a round that has already landed, and `#gun-marker` is drawn
+where a turret actually points, which in a third-person view is exactly not the
+centre. **Anything new in the middle of the screen owes that same test.**
+
+**The minimap is the one canvas in the tree that resizes itself.** `Minimap`
+observes its own element, sets the backing store to the box times the device
+ratio, and leaves the 2D context scaled by that ratio — so every line in the
+file is written in CSS pixels and comes out crisp on a handset, which the old
+fixed 220 px store never was at DPR 3. Two consequences worth knowing before
+editing it: the pixels-per-metre scale moves with the box, so the prerendered
+backdrop has to be rebuilt when the box does (`buildBase`, split out of `setMap`
+for exactly that); and the drawn furniture splits in two — **a SHAPE follows the
+box down** (the chamfer, the view cone, the rim gutter) while **a MARK that has
+to be READ has a floor** (`MIN_BLIP`, `MIN_GLYPH`), because a blip drawn to
+scale on a phone-sized map is a blip nobody can see.
+
+**A phone held upright is not a layout, it is a layout worth not being broken.**
+The game asks for landscape everywhere it can — the manifest for the installed
+app, `enterFullscreenOnTouch` for the tab — but the orientation lock is
+Android-only and refuses outside fullscreen, so a portrait viewport is one this
+HUD really does get. The top band has three tenants (the map in a corner, the
+gauge centred, the killfeed right) and at 390 px of width they stack on top of
+one another; no ladder fixes a collision between a CORNER and a CENTRE, so the
+centre column moves down past the map and takes the killfeed with it. Keyed on
+the aspect ratio and not on a width, because the question is whether this
+viewport is taller than it is wide — a narrow desktop window is still landscape.
+
+## The menu's backdrop
+
+**The main menu stands on a photograph of the map that is chosen**, and choosing
+another cross-fades to that one's. The pictures are real screenshots of the
+running game — `shots/<id>.jpg`, taken by `npm run shots` — and there is nothing
+else in the tree they could be: the game ships no authored art, so the only
+honest picture of Coldharbour at dusk is Coldharbour at dusk.
+
+**The vantage is committed beside the image** (`MAP_SHOTS` in
+[`mapShots.ts`](../src/ui/mapShots.ts)): where the camera stood, what it looked
+at, and the field of view if it is not the game's own. A screenshot is an opaque
+rectangle that says nothing about how it was made, so without the pose a map
+whose chapel moved would have a backdrop nobody could retake without hunting for
+the shot again. With it, a re-frame is a two-number edit and `npm run shots` is a
+re-run. `pos.y` is metres above the SURFACE rather than a world height, because
+the two valleys are heightfields and "eye seven metres up" survives a terrain
+edit that would leave an absolute 11.4 buried in a bank.
+
+**The table is the menu's and not the map's**, which is the one thing here that
+had to be decided rather than derived. A map's `blurb` lives on `MapDef` because
+a map's own file is the only place that cannot fall out of step with it — but a
+`MapDef` is imported by the SERVER (`Match.ts`, `simulate.ts`), which has no
+screen and no use for a quarter of a megabyte of JPEG per map. What that costs is
+that a fourth map gets no backdrop until somebody gives it a row, and **that is
+not a broken screen**: `mapShotUrl` returns nothing, the picture fades out, and
+the menu is the one it was before shots existed.
+
+**It is a root of its own — `#menu-shot`, a child of `#hud` at z-index 9 — and
+both halves of that are load-bearing.**
+
+- It must survive the card. `showMenu` rewrites `#overlay`'s markup on every map
+  step, and a layer that is removed and re-inserted has no before-change style to
+  interpolate from: the cross-fade would be a jump cut, on exactly the press it
+  exists for.
+- It must sit under the VEIL. A child paints over its parent's background
+  whatever its z-index, and the veil is `#overlay`'s background — so a picture
+  inside the card would be a picture on top of the scrim that makes the type over
+  it readable.
+
+So the backdrop needs no scrim of its own: the card in front of it is the
+scrim. **What the menu does NOT take is the shell's veil**, and that is the
+change that turned this card from a form into a front end.
+
+**The shell's veil is an ellipse, and an ellipse is the wrong shape for a
+screen whose content is a column down one side.** `.ui-veil` is dense at the
+edges and lighter in the middle, the same in every direction, which is right
+for a screen that puts its reading matter in the centre of the frame. The menu
+does not: the rail is the left third, the dossier the right, and the picture is
+what they are laid on. Tuned dense enough to hold `--dim` row labels over
+Coldharbour's dusk sky it put the whole photograph behind a wash, and every
+shipped map read as a dark rectangle; tuned light enough for the photograph it
+stopped holding the type. **There is no single density that does both, because
+the two demands are in different PLACES.**
+
+`#overlay.card-menu` therefore states its own `background` outright, and it is
+raked rather than centred: the column the rail stands in is held to ~0.95, the
+right-hand two-thirds comes through at 0.12–0.24, and the head and the foot get
+a horizontal band of their own because both carry type over whatever the picture
+is doing up there — and a photograph's sky is the brightest thing in it. The
+friend/foe glow pair and the scanlines are kept from the shell so the card is
+lit from the same two corners as every other screen; the scanlines are at half
+weight, because over a village glimpsed through a veil they are texture and over
+a photograph at full strength they are a screen door.
+
+**`--veil-in`/`--veil-out` are still set on the card and nothing on it reads
+them.** They are `.ui-veil`'s contract, and a card that unset them would take
+the shared 0.84/0.98 silently the moment anything here fell back to it.
+
+**The picture DRIFTS**, 46 seconds a length, alternating: a title screen on a
+still photograph reads as a paused game, and the same photograph moving a few
+percent reads as a place. The animation is on `#menu-shot` — the CONTAINER —
+because the two picture layers already own their own `transform`, which is the
+cross-fade's settle, and two animations on one property is one of them not
+happening. It never goes below `scale(1.06)`, so no amount of the translation
+can pull an edge into frame, and it is a transform, so it is a compositor layer
+and costs the main thread nothing. `prefers-reduced-motion` stops it, along with
+the card's entrance and the Deploy button's sheen; the cross-fade is left alone,
+being a transition rather than an animation and the thing that stops a map
+change being a jump cut.
+
+**The cross-fade waits for the image to DECODE.** Two layers, one showing and one
+being prepared, swapped on `img.decode()` — a fade into a layer the browser has
+not finished decoding is a fade into a blank rectangle followed by a pop, which
+on a cold boot is every first visit to this screen. Whichever pick is the latest
+owns the swap: a decode that lands after a later choice has been made is dropped
+rather than fighting it for the front layer, which is what makes holding Right
+along the map row safe.
+
+**Every card but the menu takes it down**, the pause included — what a pause
+stands over is the round you are playing, and a photograph of a map behind the
+map itself is the same place twice. Two things take it away for free and are
+worth knowing about rather than re-deriving:
+
+- `#hud.kitting > *:not(#loadout):not(#hud-fps)` already hides every other child
+  of `#hud` while the kit screen is up, and the backdrop is one. That rule is not
+  decoration: the weapon on the turntable is drawn by the SCENE through a hole
+  the kit screen leaves in the middle of itself, so a full-bleed picture left
+  standing at z-index 9 would be what you saw in the hole instead of the gun.
+- It is deliberately NOT in the `--ov-scale` list in `base.css` beside
+  `#overlay`, `#deploy`, `#settings` and `#lobby`. That ladder draws a screen at
+  the size it was authored for and scales it down; a photograph has no authored
+  size to be scaled from, and `inset: 0` with `background-size: cover` already
+  fills whatever viewport it is given — including a portrait phone, which crops
+  the 16:9 shot rather than letterboxing the menu.
+
+## Getting into a round
+
+Four screens stand between the title and the world, each driven by a pointer
+*and* by a pad, with no path that needs the other. The fourth is the lobby, and
+it is the one that is optional: it is how a NETWORKED round is chosen, and
+picking a match out of it leaves through `startRound` exactly as Deploy does —
+a networked round and a single-player one are the same `loading -> deploy ->
+playing` cycle, differing only in whether `Game.net` exists.
+
+**Every screen here is a LIST: move the cursor, A picks, B backs out.** That
+replaced a screen per verb — left/right for difficulty, `L`/Y for the kit, `O` for
+settings — which is a keyboard's idea of a menu: every action needs its own button,
+and an action nobody found a button for is one a pad cannot reach (the settings
+screen was exactly that). The dedicated keys survive as accelerators; none is the
+only way in.
+
+- **The cursor is `OverlayScreen`'s, and it is a class on rows that already
+  exist.** `MENU_ITEMS` is the list, `activateMenu` is what A fires, and the mark is
+  a caret on the label plus a ring on the control — never a fill, since the tier
+  buttons and Deploy button are *already* filled hot to say what is chosen. **The
+  ring has to be INSET on anything chamfered**: every button here is cut by a
+  `clip-path`, which clips its own element's outline and box-shadow along with the
+  corner, so an offset outline draws on the tier group (a plain div) and silently on
+  nothing else.
+- **A / Enter fire the cursor's row and BREAK; Start still starts the round from
+  anywhere.** Both flags come up on the same frame for A, so the order is the whole
+  mechanism — without the break, A on the settings row opens the screen and then
+  deploys the player out from under it.
+- **THE POINTER DEPLOYS ONLY THROUGH THE DEPLOY BUTTON**, on this card and the
+  round-over one. `confirmPressed` was "a button went down anywhere", mouse and
+  finger alike, which is fine on a card that is only a title and wrong the moment
+  the menu grew controls: the map and difficulty rows fire on the click's mouse-UP
+  while the confirm reads the mouse-DOWN a tick earlier, so **choosing a map or a
+  difficulty started the round on the same press**. Neither flag carries a pointer
+  now; the button carries the mouse and the tap by itself. Restoring a
+  click-anywhere confirm to a screen that has controls on it restores that bug.
+- **The cursor survives a redraw and resets when the card is RAISED**
+  (`OverlayScreen.card`). `showMenu` is called again on every difficulty change and on
+  the way back from the kit and settings screens; a cursor that jumped home each time
+  would make the row you just left the one place you cannot stay.
+
+**The LEFT STICK drives all of it, and holding a direction repeats.** It is the
+left stick alone (the right one turns the kit turntable), read raw against
+`input.menuStickThreshold` rather than through the movement deadzone, because a menu
+step is discrete and a stick resting a third of the way over must not scroll a list.
+`InputManager` folds keys, d-pad and stick into two DIRECTIONS rather than four
+buttons, so opposing presses cancel and a diagonal resolves into one step per axis;
+`stepNav` turns a held direction into the edge-and-repeat the menus read. The repeat
+is what makes a stick usable (it has no detent to tap) and deliberately does not
+extend to confirm or back.
+
+**Each screen hangs off the SHELL's tracks, and what is left screen-local is
+what only that screen has.** `--col` is gone — the one content width every
+block measured to was what made these screens a column in the middle of a
+window (see the shell, at the top of this file). `#deploy` still declares
+`--map`, because the map's side is genuinely the number the orders panel beside
+it is measured against.
+
+- **The menu's rows all state the same three tracks**, so the labels line up
+  down the rail and every control begins on one edge — a label column sized to
+  `max-content` is measured per row, and five rows would find five widths. Each
+  row is a box of its own rather than `display: contents`, because each one now
+  carries a selection: a directional wash and an accent bar down its left side.
+  The control column is `minmax(0, 1fr)`, so the four difficulty tiers and the
+  kit button span the same width. **The accelerator column is given a WIDTH
+  rather than being left to shrink-wrap**, and that is the half of the
+  alignment that was missing: the third track is `auto`, so a hint that
+  measures itself sizes that track per row — `L / Y` is thirty pixels and `O`
+  is eight — and every control on the rail started on one edge and then ended
+  on a different one, which on a column of plates is the misalignment that
+  shows. The width collapses with the hint at `display: none`, so the narrow
+  layout reserves no lane for a chip it is not drawing.
+- **The rail is CAPPED at 600 px, and the cap is what makes the picture the
+  screen.** Left to fill its `5fr` track it is 700 px of rows on a 1920 window
+  and a Deploy button as wide as a paragraph, with the dossier stretched to
+  match on the other side and the photograph reduced to whatever showed between
+  them. Capped, the rail is a column of controls, the dossier is a document,
+  and what is between and behind them is the map.
+- **The rows are GROUPED, because five equal rows are a form and three plus two
+  is a menu.** `Operation` is what the round will be made of — the map, the
+  enemy, the kit — and the two under the second tag are the places you can go
+  instead of starting one. Nothing about the cursor's order moved: `MENU_ITEMS`
+  still runs parameters, then destinations, then the action, and the tags are
+  drawn between rows the cursor was already walking in that order. On a
+  landscape phone the tags are the first thing dropped, because they are the
+  only text on the rail that names nothing you can press and the hairline
+  between the two groups says what the second one said.
+- **The map row is a STEPPER and a ladder, not a strip of buttons, and that is
+  a correctness fix rather than a style.** Six maps ship and a dev build has
+  seven; a segmented row gives each an equal share of one column, which is
+  96 px on a laptop and 42 on a phone, and every shipped map read as `HOLLO…`,
+  `GREYF…`, `COLDH…` — a picker whose labels were all the same word. The
+  stepper names ONE map at whatever size the viewport can give it and the
+  ladder under it carries what the strip of buttons was really for: how many
+  there are and which of them this is. It costs nothing in reach — left and
+  right along this row was always what stepped it, the arrows are what a
+  pointer uses, and a ladder rung is how a pointer reaches the sixth map
+  without pressing an arrow five times. **`Game.setMap` CLAMPS**, so an arrow
+  at either end is drawn `off`: an arrow that looks live and answers nothing is
+  worse than one that says it has run out of row.
+  The rung's hit area is 14 px with a 4 px mark inside it
+  (`background-clip: content-box` over vertical padding) — a 4 px target is not
+  one on glass, and a 14 px bar is not a hairline.
+  **The ladder is INSIDE the row** — a second grid line, placed in column 2 —
+  rather than a strip beneath it, so it lines up with the control it belongs to
+  and shares that row's hover. A pointer travelling down to it must not take
+  the cursor off the map row on its way to a control that is the map row's.
+- **The LOADOUT row is the one opener with no caption on it.** Its VALUE is the
+  long thing: `Marksman rifle · Scope` and `Change kit` together overran the
+  control column at every viewport where the type is at full size, so the row
+  that had something to say was the one being ellipsised — and what the caption
+  said, the row's own label and the chevron already say. The other two keep
+  theirs, and lose them below 560 px of rail, where there is no room for a
+  name, a caption and a mark on one line and the name is the one that cannot
+  go.
+- **The panel beside the rail is redrawn on every cursor move and the rows are
+  not.** The rows carry the selection as a class on elements that already exist,
+  for the reasons below; the panel has no listener, no transition and no hover
+  state on it, so rewriting it costs one box's layout and nothing that can be
+  seen going wrong. `start` gets a DEPLOYMENT BRIEF rather than nothing, and
+  that is where the cursor opens — the map, the enemy and the kit, which are
+  the whole of what the button under it is about.
+- **On this card the panel is a PLATE, and it is the only place `.ui-panel` is
+  a box.** The panel is a rule down an edge everywhere else because the
+  settings screen and the lobby stand on a solid veil, where a box would be a
+  container drawn around nothing. This card stands on a photograph that the
+  scrim deliberately lets through at close to full strength on exactly the side
+  the panel is on, so it has to carry its own darkness or the map's name is set
+  over whatever the sky happened to be doing in that frame. It is centred in
+  its track rather than stretched, and capped: full height it was a plate with
+  four lines at the top of it, which is the argument `.ui-panel` makes for
+  being a rule, made the other way round for the one screen that needs the box.
+- **The card's entrance runs on a RAISE and never on a redraw.** `showMenu`
+  rewrites this card wholesale on every map step and on the way back from the
+  kit and settings screens, so an entrance keyed to the markup existing would
+  replay on each of them — the rail would re-deal itself every time the player
+  pressed Right along the map row, which is the one press it is most likely to
+  be seen on. `setCardClass` puts `.enter` on the root only when the card was
+  not already up, exactly as the cursor is only reset then, and it has to go on
+  before the markup is written because what animates are elements that do not
+  exist yet. The dossier FADES where the rail rises, and that is a canvas
+  rather than a taste: the schematic is sized off the box it is painted into,
+  and a fade cannot even raise the question a travelling panel would.
+- **The map row's schematic is drawn from the LAYOUT, never from a built map**
+  ([`MapThumb.ts`](../src/ui/MapThumb.ts)). The deploy screen draws its map out
+  of the finished collider set, which is the honest way to draw a map you are
+  standing in; the menu is the one screen in the game where there is no built
+  map at all, and building one to illustrate a row costs the ~0.7 s the building
+  card exists to cover. Everything it reads — the water rects, the scatter
+  regions, the placements, the flags — is a module constant that was in the
+  bundle before the player pressed anything, and its palette is the map's
+  own `EnvironmentSpec`, so a fourth map is coloured by what it ships with
+  rather than by a table here somebody has to remember to extend.
+- **The one exception is the HEIGHTFIELD, and it is why this panel can paint
+  twice for one row.** A map's floor is a lazy `import()` now
+  (`MapDef.heights`, ENGINE_UPGRADE.md S7) — hundreds of kilobytes on a large
+  map, which is a thing to fetch when a row is looked at and never a thing to
+  boot with. `drawMapThumb` takes it as an ARGUMENT and goes and gets nothing:
+  `paintThumb` hands it whatever `heightsOf` already has, which on a cold boot
+  is nothing, and books a repaint for when the ground lands. The row is
+  re-tested inside that callback, because the cursor moves faster than a fetch
+  and a floor arriving for a map the player has scrolled off must not repaint
+  the one they are looking at. A flat map for a moment and then the real relief
+  is the honest order; a hole in the menu until a fetch returns is not.
+- **A `WaterRect` is an EXTENT and the waterline is DERIVED**, which is the one
+  thing on that schematic that cannot be read straight off the layout. The real
+  surface is a flat plane and the world is opaque, so a body is only the part of
+  its rect the floor does not stand in front of — and the rects say so plainly:
+  Greyfen's flood is one 250 m rect over the whole valley and Harrowmead's leat
+  is 404 m by 100, so drawing the rects reported both maps as open water end to
+  end, with flags in it. `drawWater` bakes a depth mask over the union of the
+  rects instead, against the same `waterY` the surface sits at and the same
+  `TerrainField.surfaceAt` the real bed map is baked from, and draws nothing
+  where that depth is not positive. **A map with no `WaterEnvSpec` draws no
+  water here**, because `WaterSystem.build` returns on the same test.
+- **The prose those panels carry lives with the thing it describes**, not in
+  this directory: a map's line is `MapDef.blurb` in
+  [`world/maps.ts`](../src/world/maps.ts), a tier's is `blurb` beside its own
+  `centre` in `CONFIG.bots.skill.difficulties`, and a weapon's is
+  `WEAPON_BLURBS`, which the kit screen already owned and now exports. Every
+  figure beside them is read off the same object the line is on — the flag
+  count, the extent, the view distance, the reaction time — so a panel cannot
+  describe a map or a difficulty that is not the one being played.
+- **Only the controls opt into pointer events, never the rows.** `#hud` is
+  `pointer-events: none` and the menu's confirm is a mouse-down anywhere, so a row
+  that claimed events would turn its labels, hints and the grid's gaps into dead zones
+  where a click does nothing instead of starting the round. **The cost is that a new
+  control is unclickable until it names itself**, and the failure is quiet from both
+  sides: the keyboard fires it through `activateMenu`, which never touches the DOM, so
+  the row works perfectly for whoever is testing with a pad and is dead under the
+  mouse. The screen-openers share one list in `base.css` (`kit-open`,
+  `settings-open`, `mp-open`, `#deploy-kit`) and the selection ring is a second list
+  in `overlay.css` — a fifth opener goes in **both**, not just the first. The
+  multiplayer button shipped in neither and read as a bug in the button rather than a
+  missing rule.
+- **`#deploy-actions` is a column**, now that the buttons are in an orders panel
+  beside the map rather than under it. They were a wrapping row because the
+  map's width was all they had, and on a 768-tall laptop the longest kit
+  ("Marksman rifle · Scope") did not fit beside a Deploy button — so the row
+  broke and gave two full-width buttons anyway. Every input hint is in the
+  frame's foot, which is the one row this screen has for them.
+- **The deploy screen's foot is the only one CENTRED**, and the HUD is why. It
+  is the one screen here drawn over gameplay chrome that is still up: the vitals
+  are in the bottom-left corner and the ammunition column is in the
+  bottom-right, which are exactly the two ends a full-width foot puts its hints
+  and its button on. The middle of that edge is the one part of it the HUD
+  leaves empty.
+- **Its one-column rule is keyed on WIDTH alone**, unlike every other screen's.
+  Those collapse on height as well, because a rail and a panel side by side in a
+  short window have the room and not the height. This screen's second column is
+  240 px of buttons beside a map that is height-led — so a short window is
+  exactly where the two belong side by side, and stacking them there takes the
+  map's height away to spend on the thing that did not need it. A landscape
+  phone keeps both columns; a portrait one is what the rule is for.
+
+**The menu and round-over card carry a `Deploy` button**
+(`OverlayScreen.bindStart` → `Game.onStart`), and it is the **only** thing on either
+card a pointer can deploy with. It began as a redundant target beside a
+click-anywhere confirm, which is why it exists at all: an instruction in prose is not
+a target, and "click, press Enter, or press Start" made a pad player work out which
+was theirs. It now carries the mouse and the finger by itself. It is also where the
+menu's cursor starts, keeping Enter and A meaning "start the round" the moment the
+title appears.
+
+**In a MATCH that button is a BALLOT instead**, and the block it stands in
+(`.ov-next`) is the only part of the round-over card that differs between an
+offline round and a networked one. Offline the next round is the player's to
+ask for; in a match the next MAP is the players' and the round is the
+authority's, so what is drawn there is three candidates, a tally and a
+countdown — and against a server that runs no vote, the wait line that was
+there before ("the server is choosing"), which is still exactly what is
+happening. The block keeps the button's width and its place in all three, so
+the result plate above it does not move depending on who you are playing
+against.
+
+- **The ballot is a GRID OF EQUAL SHARES**, which is this file's rule about a
+  row of picks, and the narrow rule changes the COUNT rather than the break —
+  under 560 px it is one column, because three map names across a phone is
+  three ellipses and a map you cannot read is not one you can vote for.
+- **WHERE THE CURSOR IS, WHAT YOU VOTED FOR AND WHAT IS WINNING ARE THREE
+  FACTS AND THEY ARE DRAWN THREE WAYS.** `.sel` is the cursor (a hot rule down
+  the leading edge, the menu's own mark), `.on` is this player's vote (filled,
+  because it is the one thing on the row the player did), and `.lead` is what
+  will actually be built if nothing moves (the quietest, because it is a fact
+  about the tally and the tally is already in the bars). A player whose own
+  vote is losing has to be able to see both at once, and one highlight would
+  say one of the three and imply the other two.
+- **The tally is the authority's and the cursor is not**, which is why the two
+  are separate fields on the screen as well as separate classes: arrowing
+  along the row would otherwise cast four votes, and a locally-lit button under
+  a tally that does not count it is the failure `docs/multiplayer.md` argues
+  the addressed `choice` field out of.
+- **The pointer votes and takes the cursor with it**, so a player who clicks and
+  then reaches for the keyboard carries on from where they clicked. It is the
+  same pointer-events carve-out the tier row and Deploy have: the candidates opt
+  in, the card around them stays inert.
+- **The map NAMES go in with `textContent`**, alone on this card among strings
+  that are written as markup — a candidate this build has no row for is drawn as
+  the id the authority sent, which is a string chosen by whatever is on the far
+  end of the socket.
+- **The countdown is `tabular-nums` in a fixed box.** It is rewritten once a
+  second, which is exactly the cadence at which a label that steps sideways as
+  the number narrows reads as a fault; and it is written once a second rather
+  than once a frame because `Game` compares the whole second before it touches
+  the DOM.
+
+**That button is why the deploy screen's confirm is `menuConfirmPressed`.** It
+changes state on the down edge, which puts the `deploy` branch in front of the very
+click that asked for it — and the first deploy of a round has `respawnT` at 0, so a
+confirm counting the mouse fired immediately and dropped the player in at whichever
+spawn the list started on, skipping the screen. Enter and pad A only; the map takes
+its own clicks and the two buttons take their own.
+
+**The spawn is steppable** (`DeployScreen.moveSelection`, wired to the menu
+directions in `Game`'s `deploy` branch, so the stick steps it too). Both axes step
+the same list: the spawns are points scattered over a map rather than a row or
+column, so no direction *means* anything, and a direction that does nothing reads as
+a screen ignoring the pad. The selection is stepped *before* `update()` redraws, so
+the marker and the status line — which names the selection, because a highlight
+300 px away is not a label — move on the frame the key was pressed.
+
+**`#deploy-go` is the pointer's way off that screen**, since the confirm no longer
+takes a click. Pointerdown, like the map's markers: the same event goes on to take
+the pointer lock, which it can only do once `spawnPlayer` has moved the state to
+`playing`. It greys itself (`.waiting`) while `confirm()` is still a no-op.
+
+**The MIDDLE of the kit screen is a turntable carrying the real viewmodel.** It
+is not a second model, not a render target and not a second camera: `ViewModel`
+simply has a pose that is not the carried one (`beginInspect` / `spinInspect` /
+`updateInspect` / `endInspect`), and the weapon is already parented to the camera
+and drawn in `VIEWMODEL_GROUP`.
+
+- **THE BAY IS MEASURED, and that one change is what the rest of this section is
+  downstream of.** The weapon is placed by back-projecting a SCREEN position, and
+  that position used to be a constant — `CONFIG.viewmodel.inspect.anchorX: 0.46`
+  — welded to a `--panel: 46%` in `#loadout`'s stylesheet, with a note in each
+  file saying to change the other. Two numbers that had to agree meant the screen
+  had exactly ONE possible layout: a full-height column beside a full-height
+  hole. Everything else on it was then squeezed into that column — ten buttons,
+  a chart and three paragraphs, with the footer under the bottom edge of a
+  1280x720 window — next to half a screen of empty bay. `LoadoutScreen.stageBay`
+  measures `.lo-well` every frame and hands the rect to `updateInspect` through
+  `InspectParams.bay`, so the weapon goes wherever the hole is: **move the
+  layout freely, in either orientation, and the weapon follows.**
+- **What is left in `CONFIG` is the weapon's own SIZE, and the fit takes the
+  worse of two axes.** `frameWidth`/`frameHeight` are the rifle's span as a
+  multiple of the frame's HEIGHT (the axis Babylon's FOV is fixed on, which is
+  why the old `aspectReference` could be retired with the anchor), `frameMargin`
+  is how much of the bay it may fill, and the weapon is pushed back until both
+  fit. The old form could only ever be told about the WIDTH; a measured bay can
+  be short as easily as narrow. **`frameNearest` is the floor**, and it exists
+  because the rule now runs the other way too: the bay on a monitor is roomier
+  than the framing was ever authored for, so the fit is allowed under 1 and the
+  spare room is spent on the weapon rather than on air around it.
+- **The bay is a hole, and it no longer needs a scrim.** Everything the kit
+  screen draws is DOM and DOM is above the canvas, so a backdrop over the bay
+  would dim the weapon along with the world. What the weapon is read against is
+  a card hung behind it IN THE SCENE (`CONFIG.viewmodel.inspect.backdrop`,
+  [`weapons.md`](weapons.md)) — and because that card is cut to the WHOLE
+  frustum, the map is already gone before a pixel of this stylesheet is drawn.
+  That is what lets the screen be plates with air between them rather than one
+  opaque column with a hard edge down the middle of the window; `.lo-scrim` was
+  doing a job something else had taken over. `show()` still marks `#hud` so the
+  CSS can hide the menu, the deploy map and every gauge while the kit is up.
+- **The card's pool of light follows the bay**, repainted (`paintKitPool`) when
+  the centre moves by more than a rounding error rather than baked once at
+  build. A pool left at the old anchor is a bright patch on an empty corner
+  with the weapon in the dark beside it, which is what a phone would have got.
+- **The turntable rotation is a quaternion, and the only thing allowed to write
+  one.** The carried pose is Euler, composed in the weapon's own frame, so at a
+  side-on yaw the pitch a drag asks for arrives as a roll. `endInspect` dropping
+  the quaternion is what lets the Euler pose come back at all — while one is set
+  Babylon ignores `rotation` entirely.
+- **It rotates about a derived pivot, not the node's origin** (which on a rifle
+  is the receiver — a turntable about that would swing the weapon around the
+  screen). `applyFit` measures the pivot from the weapon's own muzzle landmark.
+- **The hands let go.** A forearm cut off at the elbow reads fine on a carried
+  weapon and as a severed arm on a bench, so `ViewModel` hides the arm meshes for
+  the duration — one place writes mesh visibility.
+
+**THE LAYOUT IS THREE ZONES AND A STRIP, split by what each thing IS rather than
+by what fits where.** Head and foot are full-bleed bands; between them, a WEAPON
+strip of six cards across the top (the decision the other three depend on, so it
+gets the width), a column of the things FITTED to it down the left (optic,
+anti-vehicle, finish), the BAY in the middle, and the CHART and the copy down the
+right — the only things on this screen that are read rather than pressed. The
+three columns share one top line under the strip (`justify-content: flex-start`,
+deliberately, because two left-aligned stacks starting at two different y is the
+misalignment the eye picks out of any layout), and both side columns SCROLL, which
+is the fix for the one failure the old screen had at every size: a column that ran
+out of room simply put its last row under the bottom edge with no way to reach it.
+
+- **A ROW OF PICKS IS A GRID OF EQUAL SHARES, NEVER A WRAPPING FLEX ROW.** This
+  is the rule that deleted the most from this section, and it is a correctness
+  rule rather than a style. A flex row cannot be squeezed below its own longest
+  word, so it breaks — and *where* it breaks was decided by a `flex-basis` tuned
+  per viewport across four media queries, with a standing instruction to MEASURE
+  the break by hand whenever a weapon or an optic was added, because a stranded
+  button (five on a line and one alone underneath at the column's full width) is
+  invisible to a typecheck, to a review of the diff, and to anyone not looking at
+  that viewport. Two regressions were found that way and neither would have been
+  found any other way. `grid-auto-flow: column` with `1fr` columns cannot strand:
+  six items are six equal shares at every width there is, and a narrow viewport
+  changes the COUNT of columns rather than the break. Nothing here needs
+  measuring when a weapon is added any more.
+- **Where a grid does wrap, it wraps into ALIGNED columns.** The portrait tier's
+  weapon strip is `repeat(auto-fit, minmax(118px, 1fr))`, so a seventh card sits
+  under the first at the same width — which is what a grid should look like when
+  a table stops being a round number, rather than one item alone at full width.
+- **Names WRAP; nothing is truncated.** Two names in this kit are long enough to
+  overrun a narrow column — "Submachine Gun" and "Anti-Vehicle Mines" — and
+  "ANTI-VEHICLE MI…" says less than the caption above it already does. Every list
+  here is a grid, so a row whose tallest cell has wrapped stretches the rest to
+  match and the column keeps its rhythm.
+- **The four picks are one control drawn four ways.** `.lo-block` is a `.frame`
+  hull with a caption over a list, and the ACTIVE block — the one the arrow keys
+  are stepping — says so by taking the hot colour as its `--frame-edge` and
+  lifting its `--frame-fill`. Two custom properties are the whole of the
+  selection treatment, which is why a fifth slot would need no new styling.
+- **The FINISH is the one pick on this screen that is not a trade, and the one
+  row that is not drawn like the others.** Every other choice here costs
+  something — a magnification is a field of view, a burst is four tenths of a
+  second — and a finish costs nothing, so it gets no bar on the chart and never
+  moves one. What it has instead is the bay: its NAME and its description are
+  written under the weapon rather than beside the bars, because it is the one
+  pick whose whole effect is the thing already turning on the turntable.
+- **All sixteen finishes are offered on every gun, and sixteen is what took the
+  NAMES off the buttons.** A finish says what it does with COLOUR because its
+  name cannot — "Verdigris" and "Oxblood" are words you would otherwise try one
+  at a time — so the button IS the swatch: three flat stops in the order the eye
+  reads a weapon (furniture, receiver, fittings), in a grid of `.lo-swatch`
+  rather than a row of `.lo-opt`. **Eight columns rather than `auto-fit`**,
+  because the table is sixteen and eight is two full lines with nothing stranded
+  on a short one.
+- **The name of the lit swatch is written in the BLOCK'S CAPTION**, in the hot
+  colour beside the dim "Finish" label, and described in full by the bay's
+  paragraph. Both, not either: the paragraph is the first thing a short viewport
+  drops, and a grid of unnamed colours with no name anywhere on the screen is
+  exactly the row-you-try-one-at-a-time the swatches exist to avoid. A `title`
+  covers the fifteen that are not lit, for the pointer that has one.
+- **The selected swatch is RINGED rather than filled**, which is the one place
+  `.on` changes its mind on this screen: every other button says it is chosen by
+  taking the hot colour as its background, and a swatch that did that would
+  paint over the only thing it has to say. The ring is inset (a `clip-path` cuts
+  an outer shadow off) with a dark line inside it, which also keeps two pale
+  schemes — `whitewash`, `frostbite` — from melting into each other and into the
+  plate behind them.
+- **It gives way in three tiers, and each is keyed on the thing that actually
+  runs out.** Below **1180 px** nothing changes — three columns hold, because
+  the side tracks' minimums are `clamp()`ed and a word set at a size that falls
+  with the viewport needs less room on the viewport where there is less. At
+  **`max-height: 620px`** — a phone held sideways — the side columns are given
+  MORE of the width and the lists go two-up as CARDS, a name over its figure
+  rather than beside it, which is what makes two columns fit in a track that
+  held one; the head and all the prose go, for the reason they always did. At
+  **`max-width: 720px`** the screen becomes one column: the bay is a band across
+  the top at `clamp(150px, 30vh, 300px)` and everything else scrolls underneath
+  it, with the weapon pinned in its band while the list moves — which works only
+  because the bay is measured rather than assumed.
+- **`.lo-choices` is `display: contents` at every width above that, and a real
+  scrolling box below it.** One element with two jobs: `display: contents` makes
+  `.lo-pick`, `.lo-fit` and `.lo-read` grid items of `#loadout` itself, placeable
+  anywhere in the frame; a phone turns the same element into the box that does
+  the scrolling. The alternative is a second copy of the markup for the narrow
+  case.
+- **`--ov-scale` still does not reach this screen, but the reason it could not
+  has gone.** The old note said a transform would move the hole and leave the
+  weapon behind it; a measured rect moves with the transform, so it would follow
+  now. It is left out because the layout fits the viewports it is given on its
+  own, which is the better answer.
+
+`Game.updateKitStage` drives it, because `loadout` is the one lid state showing live
+3D and owes by hand the per-frame pushes only `updateGameplay` makes. The camera
+position is the load-bearing one — the cel shader fogs against `camPos`, which
+outside a round is whatever the last gameplay frame left and `Vector3.Zero()` before
+the first, so a kit opened off the main menu would fog the weapon to a grey
+silhouette. It also puts up the three bench lamps (`CONFIG.lighting.kitLamps`),
+through `LightingSystem` like every other light because a carried light always wins
+a slot; they are far brighter than the shoulder lamp on purpose, since moonlight
+alone on a night game's albedo is a black silhouette. **The third of them stands
+BEHIND the eye and is there for the polish rather than for the light**: a mirror
+hands back what is behind the camera, so with both lamps beyond the weapon every
+reflection a chrome finish could return landed on the faces turned away from the
+screen — which is what made the gold plate read as tan paint on the one screen
+whose job is to sell it. `stowKit` is the single
+teardown — screen, pose and lamps — and all four exits go through it, because a
+carried light nobody removes survives `lighting.clear()` and follows the player into
+the round.
+
+
+## The controls a phone plays with
+
+`TouchControls` lives in this directory, builds a root, appends it to `#hud` and
+carries a stylesheet of its own, so by every rule above it is a screen. It is
+counted as one nowhere, because **what it IS is a device**: `InputManager` polls
+it once a frame exactly as it polls a gamepad (`setTouchSource`), and nothing
+downstream of that poll has heard of it. The distinction is worth keeping because
+it decides where a change goes — a new control is a button in that file and a
+term in `InputManager.update`, never a new callback into `Game`.
+
+The shape of the set — floating stick left, look drag right, cluster over both,
+a fire button that also steers — is the one Call of Duty Mobile and Delta Force
+Mobile both arrived at, and the argument for each part is in the file's own
+header where the code that implements it can be read beside it.
+[`pwa.md`](pwa.md) carries the half that is about the phone rather than the
+game: when the controls are drawn, why a tap arrives twice, and why the layer is
+`fixed` rather than `absolute`.
+
+What belongs *here*, with the other screens:
+
+- **It is the one thing on `#hud` that is drawn for exactly one state.** Every
+  other screen is raised and lowered by a transition; this one is pushed from
+  `Game.tick` every frame (`pushTouchControls`) next to the scoreboard's push and
+  for the same reason — the state a frame ENDS in decides, so no boundary owes a
+  call. `playing` alone, which is narrower than `inRound`: the deploy screen is a
+  map you tap a spawn on and the death cam is four seconds of watching, and in
+  both there would be a body's worth of controls over a body nobody is driving.
+- **Taking it away drops what it was holding.** `setVisible(false)` calls
+  `releaseAll`, and that is the whole reason visibility is a method rather than a
+  CSS class: a pause taken with the trigger down must not come back with the
+  trigger down. The class rules in `touch.css` (`#hud.paused #touch` and its
+  three neighbours) are the one-frame belt to that brace — the push lands on the
+  next tick, and a trigger drawn over the pause card for a frame is a trigger
+  somebody tries to press.
+- **The three things it draws that it cannot know are pushed in**, exactly as
+  every gauge in `HUD` is and with the same write guards: whether the body is
+  crouched (it owns no crouch latch — `InputManager` has one already, shared with
+  `C` and the pad's B), whether the magazine wants attention, and what the
+  vehicle verb would do right now. Nothing else about the round reaches it.
+- **One button is CONTEXTUAL, and it is the whole reason a phone can drive.**
+  Every other control on the layer is a key that has always been there, because
+  a key is something a player presses to find out what it does — and glass has
+  nothing to press until something is drawn under it. So `setUse` gives the
+  vehicle verb a label and puts it on screen, and null takes it away again;
+  `Game` decides, from the same `offerUse` that writes the HUD's prompt, so the
+  sentence on the button and the sentence on the HUD cannot disagree.
+  Two rules come with it: taking the offer away also LETS GO of the button (a
+  finger resting on `EXIT TANK` when the hull brews up must not be reported held
+  when the next offer puts it back), and `releaseAll` hides it as well as
+  clearing it, because here the class is not a look but the control's whole
+  existence.
+- **The buttons are `.frame`s**, the same chamfered hull the panels use, cut on
+  the same two corners. Not decoration: `base.css` bans `border-radius` on
+  gameplay chrome, and a set of round translucent buttons is precisely the "web
+  card" that rule exists to keep off this HUD.
+- **The one control that is not input is the pause button**, and it is a callback
+  out (`onPause`) like every other screen's, guarded on the state in
+  `wireScreens` like every other one. A phone has no Escape key, so without it a
+  round cannot be left at all.

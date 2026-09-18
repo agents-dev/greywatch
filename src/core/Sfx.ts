@@ -1,0 +1,3886 @@
+/**
+ * Sfx.ts — All audio: synthesized WebAudio, and SIXTEEN recordings laid over
+ * it: one report per weapon in the kit, the gun a hull's second seat lays, the
+ * two halves of the player's own magazine change, the four beats of a bolt
+ * cycle and the two blasts.
+ * Owns: the AudioContext, one cached noise buffer shared by every shot, one
+ * shared convolution reverb every gunshot sends into, a master soft clip, the
+ * voice cap (CONFIG.audio.maxVoices — over-cap sounds are skipped silently),
+ * positional panning relative to the listener, and the decoded samples
+ * `src/core/samples.ts` tables.
+ * The samples are the one thing here that is not synthesized — the guns, one
+ * magazine change and one bolt cycle, and nothing else in the game — and they
+ * are held as a PREFERENCE: fetched fire-and-forget off `unlock`, substituted
+ * inside `shoot`, `botShot`, `reload` and `boltCycle` only when the decode has
+ * landed, and absent from every other sound in the file. The per-shot ACTION
+ * is still `actionPitch`/`actionVol` on every weapon, and so are the reload's
+ * own catch and bolt beats — a mechanism is voiced here, and the six beats
+ * that are recorded are still PITCHED here, since one shared recording says
+ * nothing about which weapon it is going into. A weapon with no `sample`, a
+ * decode that has not finished and a fetch that failed are one case with one
+ * answer — the synthesized sound — which is what keeps the recording
+ * deletable, and `reload` and `boltCycle` make that claim BEAT BY BEAT rather
+ * than for the gesture as a whole. See `samples.ts` for why that is the whole
+ * of the bargain.
+ * Invariants: never generate a fresh noise buffer or impulse response per
+ * sound — both are built once on unlock. setListener() is called once per
+ * frame by Game, after the camera update. Firefox needs the legacy
+ * setPosition/setOrientation path — keep both. Nothing here schedules a
+ * repeating sound: footsteps are one-shots fired by the caller's own gait
+ * phase (the camera's bob, a bot's walk cycle), never by a timer in here.
+ * The sustained voices are ENGINES and AMBIENCE, and neither is a
+ * counter-example: each is a graph of sources held open, not a timer firing
+ * one-shots — the only things in them that repeat are an oscillator and a
+ * looping buffer, which are the audio clock's business rather than the
+ * frame's, and they stop with that clock like everything else. Nothing in
+ * either is a recording and nothing in either is going to be: see
+ * `docs/audio.md`, where one ambient bed prices out at ten times the whole
+ * sampled gun kit.
+ * The AMBIENCE half is a place in the world that makes a noise on its own —
+ * `ambience`/`ambienceOff`/`ambienceAllOff` over `buildAmbience`: a roar, a
+ * LIST of humps, a breath and one impulse-excited resonator per event row, so
+ * randomness costs no schedule. Both halves are lists for the same reason and
+ * it is the reason there are three kinds and no branch: a fire is one hump
+ * over a roar with the events carrying the top, and running water is TWO
+ * humps with the events a garnish, so **a second hump is a second row**. Both
+ * were FITTED to recordings rather than tuned — `docs/audio.md` carries the
+ * tables, the three silent failures the fire's fit turned up and the fourth
+ * the water's did. `systems/AmbienceSystem.ts` decides WHICH emitters are
+ * worth a voice and this file decides what one sounds like. Its one
+ * difference from the engines below is what a HELD world is owed: an engine
+ * is driven by a load a lid freezes and owes silence, a fire is driven by
+ * nothing and does not — see `ambienceAllOff`.
+ * The ENGINE half has two KINDS and one graph. The hull the player is
+ * driving (`engineOn`/`engineDrive`/`engineOff`) is unpanned and uncapped for
+ * the reason the player's own report is; every other occupied hull within
+ * `CONFIG.audio.engineRange` gets a spatialised one (`hullEngine`/
+ * `hullEngineOff`/`enginesOff`), which is a sound in the world like any other.
+ * Teardown either way is a loop over `EngineVoice.sources`, and a source added
+ * to that graph without a place on that list is a voice running unheard for
+ * the rest of the session.
+ * That is two kinds of PLACEMENT and it is a different axis from what the
+ * machine IS: `EngineKind.rotor` is the second, a nullable block that turns
+ * the same graph from a piston engine geared to road wheels into a turbine
+ * hung off a disc. Both arms are `buildEngine` and the fork is in
+ * `driveEngine`, because the difference is not levels — it is that a rotor's
+ * note is GOVERNED and a piston engine's is not.
+ */
+import type { Vector3 } from "@babylonjs/core";
+import {
+  CHANNEL_GROUPS,
+  CONFIG,
+  MIX_CHANNELS,
+  MIX_GROUPS,
+  type MixChannel,
+  type MixGroup,
+} from "../config";
+import type { ReportVoice } from "../entities/weapons";
+import { SAMPLE_URLS, type SampleId } from "./samples";
+
+/**
+ * How far past full scale the master soft clip stays roughly linear. 3 lets a
+ * firefight stack three simultaneous full-level sounds before the curve bends
+ * enough to hear, and saturates rather than clipping past that.
+ */
+const SOFT_CLIP_DRIVE = 3;
+
+/**
+ * The ambience breath's own sample rate, its length, and the wander it is
+ * smoothed to — see `buildBreathBuffer`. 3000 Hz is the lowest a WebAudio
+ * buffer may state, and this signal has nothing in it over a few hertz.
+ *
+ * The length and the reference are ONE decision: a kind's breath plays this
+ * buffer at `breathHz / BREATH_WANDER_HZ`, so 24 seconds at 1 Hz gives the
+ * fire's 1.2 the twenty-second loop it has always had, and a SLOWER breath
+ * gets a proportionally longer one for free — the shore's 0.28 loops every
+ * 86 s. That is the right way round: a slow swell is exactly the one an ear
+ * could catch coming round.
+ *
+ * It costs 288 KB, once, beside the noise buffer's 192 — and it is a fixed
+ * cost rather than a per-kind one, because the rate is a playback rate and
+ * a fourth kind is a fourth `breathHz` reading this same buffer.
+ */
+const BREATH_BUFFER_RATE = 3000;
+const BREATH_SECONDS = 24;
+const BREATH_WANDER_HZ = 1;
+
+/**
+ * A decoded recording, with the silence at each end already measured off.
+ *
+ * The trim is the whole reason this is a struct rather than a bare
+ * `AudioBuffer`. An encoder is free to pad — every MP3 opens with a frame of
+ * silence the decoder is only sometimes told to drop — and a file dropped in
+ * by hand carries whatever slack it was cut with. Both come out as LATENCY on
+ * a sound fired ten times a second, which is the one thing a gunshot cannot
+ * have; and the tail costs voices, because a buffer source is counted against
+ * `maxVoices` for as long as it is scheduled, silence included. So the buffer
+ * is measured ONCE on decode and every shot starts at `offset` and stops
+ * after `duration`, and nothing about the file's format has to be trusted.
+ */
+interface LoadedSample {
+  buffer: AudioBuffer;
+  /** Seconds into the buffer where the sound actually starts. */
+  offset: number;
+  /** Seconds of it worth playing. */
+  duration: number;
+}
+
+/**
+ * Below this the trim calls a sample silent.
+ *
+ * -54 dBFS, and it is deliberately well under the level a tail stops being
+ * AUDIBLE at rather than at it: what this decides is where a recording is cut,
+ * and the cost of the two mistakes is not symmetric. Slack left on the end is
+ * a few milliseconds of a voice, which the cap can afford; a floor raised
+ * until it starts eating decay takes the end off a gunshot, which is the half
+ * of the sound the room is supposed to answer. Measured on an untrimmed
+ * 0.68 s master: -46 dBFS cut it at 0.298 s against this floor's 0.455, so
+ * the tighter one was throwing away 157 ms of real decay.
+ *
+ * **It finds all but a millisecond of every file that ships, and that is the
+ * correct outcome rather than a sign it is dead code.** The CUT lives in
+ * `audio/manifest.json` where a reviewer can read it (see `docs/audio.md`);
+ * measured in Chromium, seven of the eight decode with `offset` 0 and the
+ * whole buffer played, and `mountedGun` gives back 1.1 ms because its cut
+ * starts in a trough that is genuinely under this floor. What this is, is the
+ * guarantee that nothing about a file's FORMAT has to be trusted — a container
+ * that decoded with leading padding would be absorbed here silently instead of
+ * putting latency on a trigger.
+ *
+ * **What it cannot do is rescue a LEAD**, which is why three of the masters
+ * are trimmed at the FRONT in the manifest rather than left to this: the
+ * carbine's report starts 32 ms into its master, the LMG's 50 ms into its and
+ * the mounted gun's 40 ms into its, and the pre-noise in front of them sits at
+ * -6 to -27 dB — dozens of dB over this floor, so it reads as sound and is
+ * played.
+ */
+const SAMPLE_FLOOR = 0.002;
+
+/**
+ * What a recording plays at, against `ReportVoice.level` of 1.
+ *
+ * The one number to turn when a sample is too loud or too quiet beside the
+ * synthesized weapons around it, and it is here with `HULL_ENGINE_LEVEL`
+ * because it is a mix decision about this file's own graph rather than
+ * something a weapon should be restating.
+ *
+ * **It assumes a master that peaks near 0 dBFS, which is the pipeline's
+ * convention rather than an accident** — `audio/src/` holds normalized
+ * recordings, so one number levels all of them. 0.5 against a full-scale
+ * sample lands the shot at ~0.5, which is where the synthesized report's own
+ * transient sits (the soft clip's note below measures it at 0.45). A master
+ * cut quiet would need this raised and would then make every OTHER sample
+ * loud, so the fix for a quiet recording is the recording.
+ */
+const SAMPLE_LEVEL = 0.5;
+
+/**
+ * What a recorded MECHANISM plays at, against `ReportVoice.actionVol` of 1.
+ *
+ * `SAMPLE_LEVEL`'s sibling, and a separate number for the same reason `clack`
+ * is not `burst` with different arguments: a magazine catch is not a gunshot,
+ * and the two families sit about 10 dB apart. The arithmetic at both ends of
+ * that — a report plays at ~0.5 and the synthesized transient it stands in for
+ * measures 0.45, while a `clack` at `vol` 1 asks `burst` for 0.28 and the
+ * bandpass takes roughly half of it back, landing near 0.14. So a full-scale
+ * recording of a mechanism belongs at about 0.3 of `SAMPLE_LEVEL`.
+ *
+ * **It matches the PEAK and will still read fuller than the click it
+ * replaces**, deliberately: 45 ms of filtered noise and a 148 ms recorded
+ * gesture with a slap in it are not the same amount of sound at the same peak.
+ * That is what the recording was added for. This is the one number to turn if
+ * a magazine change sits wrong beside the weapon it is being fed into.
+ */
+const MECHANISM_LEVEL = 0.15;
+
+/**
+ * What a recorded BLAST plays at, against a `power` of 1 and at the muzzle.
+ *
+ * The third of these, and the family it names is the loudest thing in the
+ * game rather than the quietest: a report stands in for five layers of which
+ * a lowpass has already taken most of the amplitude, and a blast stands in
+ * for four of which one is a SINE at 0.5 and another is a near-unfiltered
+ * crack at 0.7. Measured against the synthesis it replaces — the crack's
+ * highpass passes almost all of a noise slice, so it lands near 0.66; the
+ * body's lowpass at 900 Hz leaves about 0.11 RMS of its 1.0; the chest thump
+ * is a sine and peaks at its gain exactly — a close blast sums to roughly 0.5
+ * RMS at the crack, where a full-scale master measures 0.4 through its own
+ * loud half. So the recording sits just UNDER unity rather than at half like
+ * a report, and the master soft clip absorbs what an encoder overshoots.
+ *
+ * **`gain` is still spent on top of it**, because that is the game's claim
+ * about how much bigger a shell is than a grenade and not the recording's —
+ * the same split `ReportVoice.level` makes against a report's file.
+ */
+const BLAST_LEVEL = 0.9;
+
+/**
+ * What a recorded LAUNCH plays at, at the muzzle of the tube.
+ *
+ * The fourth of these, and it sits where the sound does: between a report's
+ * 0.5 and a blast's 0.9, because a shoulder tube is neither a rifle nor a
+ * hundred and twenty millimetres. Reasoned from the four layers it stands in
+ * for, exactly as the other three were — the ignition is a highpass over a
+ * noise slice at 0.7 and a highpass passes nearly all of one, so the synthesis
+ * peaks near 0.66, where a blast's crack lands at that same 0.66 but on top of
+ * a body and a chest thump that are each half again as loud. So the recording
+ * sits just under 0.7 where a blast's sits just under unity, and the master's
+ * own cut measures 0.35 RMS at a peak of 0 dBFS.
+ *
+ * **`Sfx.launcher` has no `ReportVoice` to divide this by**, which it shares
+ * with `cannon` and with nothing else in this file: an AT item is carried as a
+ * weapon and voiced as nothing like one (`docs/antitank.md`), so there is no
+ * `level` and no `pitch` to spend on the file and `v` alone varies it.
+ */
+const LAUNCH_LEVEL = 0.7;
+
+/**
+ * Where the transient is inside each recorded MECHANISM, in the file's own
+ * seconds and measured from what `trimSample` hands back rather than from the
+ * head of the buffer.
+ *
+ * **These six are why `reload` and `boltCycle` schedule a sample by its PEAK
+ * where every other caller schedules one by its start.** A report's transient
+ * IS its start; a magazine going home is an ARRIVAL, with the fresh one rising
+ * and rocking into the well ahead of it, and `CONFIG.viewmodel.reload` draws
+ * exactly that approach between `insertFrom` and `magSeat`. Scheduled by the
+ * start, the slap would land 188 ms after the frame the weapon is drawn taking
+ * it. The bolt's four are the same shape and more of it: every one of them is
+ * a mass arriving somewhere with the travel that put it there in front, which
+ * is why the two synthesized SLIDES retire into these rather than playing
+ * under them.
+ *
+ * **They are measured off `audio/manifest.json`'s trims and are not free
+ * parameters.** Move a `trim.start` on any of those rows and re-measure the
+ * constant here, or the sound slides off the picture — which is the contract
+ * the beats below already have with `CONFIG.viewmodel.reload` and
+ * `CONFIG.viewmodel.cycle`, one level down.
+ *
+ * **And a PEAK is a claim on the beat in front of it, which is what bounds a
+ * rate.** `mechanism` starts a file `peak / actionPitch` before the frame the
+ * gesture is drawn arriving, so a beat at `f * duration` fits only while
+ * `f * duration >= peak / actionPitch` — and `mechanism`'s clamp turns an
+ * overrun into a LATE transient rather than a crash. `BOLT_LIFT_PEAK` is the
+ * tight one, because `cycle.lift` is 0.16 and is the shortest window in
+ * either gesture: at the sniper's 0.68 it holds to a `fireRate` of 1.0/s
+ * against the 0.8 it ships, and its trim was moved 44 ms into the master to
+ * buy that. The other five have between two and eight times the room.
+ */
+const MAG_OUT_PEAK = 0.076;
+const MAG_IN_PEAK = 0.188;
+const BOLT_LIFT_PEAK = 0.109;
+const BOLT_BACK_PEAK = 0.115;
+const BOLT_HOME_PEAK = 0.133;
+const BOLT_LOCK_PEAK = 0.084;
+
+/**
+ * Measures the silence off both ends of a decoded recording — see
+ * `LoadedSample` for why it has to be measured rather than trusted.
+ *
+ * Runs once per file on decode and walks every channel, which is a few
+ * hundred thousand comparisons for a gunshot and happens off a fetch that has
+ * already cost a network round trip. The head backs off a millisecond before
+ * the first sample over the floor, because a transient that starts exactly AT
+ * the threshold starts mid-rise and clicks; the tail does not need the same
+ * courtesy, since a sound already under the floor cannot step to zero
+ * audibly.
+ *
+ * A file that is silent throughout comes back as the whole buffer rather than
+ * as nothing, so a bad recording is heard as a bad recording instead of
+ * disappearing into a fallback that would look like the sample never loaded.
+ */
+function trimSample(buffer: AudioBuffer): { offset: number; duration: number } {
+  let first = buffer.length;
+  let last = -1;
+  for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+    const d = buffer.getChannelData(ch);
+    for (let i = 0; i < first; i++) {
+      if (Math.abs(d[i]) > SAMPLE_FLOOR) { first = i; break; }
+    }
+    for (let i = d.length - 1; i > last; i--) {
+      if (Math.abs(d[i]) > SAMPLE_FLOOR) { last = i; break; }
+    }
+  }
+  if (last < first) return { offset: 0, duration: buffer.duration };
+  const rate = buffer.sampleRate;
+  const offset = Math.max(0, first / rate - 0.001);
+  return { offset, duration: (last + 1) / rate - offset };
+}
+
+/**
+ * What a shooter with no weapon of its own is heard as.
+ *
+ * Not a fallback: every bot in the game carries the same rifle on its rig
+ * (`SoldierModel`'s `bot-rifle`) and fires the one flat round `CONFIG.bots`
+ * describes, so this is the weapon in its hands. It is also the identity
+ * voice — every field of the rifle's row is 1, because that row IS the
+ * reference report `shoot` is written around — which is why naming the rifle
+ * here and meaning "no deviation" are the same statement rather than two that
+ * can drift apart.
+ */
+const FLAT_REPORT: ReportVoice = CONFIG.weapons.rifle.report;
+
+/**
+ * Which slider a round arriving lands on, by what it landed ON.
+ *
+ * The one place the mixer's taxonomy is finer than this file's own: `impact`
+ * builds one layer for three of these and two for glass, but a round on a man
+ * and a round on a window are two sounds a person has an opinion about, so
+ * they are four faders. A `Record` over the same union `impact` takes, so a
+ * fifth surface cannot reach the game without one.
+ */
+const IMPACT_CHANNEL: Record<
+  "flesh" | "ground" | "hard" | "glass",
+  MixChannel
+> = {
+  flesh: "impactFlesh",
+  ground: "impactGround",
+  hard: "impactHard",
+  glass: "impactGlass",
+};
+
+/**
+ * How much louder somebody else's engine is AT SOURCE than the one the player
+ * is sitting in — `Sfx.hullEngine`, against `engineOn`'s reference of 1.
+ *
+ * A level rather than a distance, so it is here with the rest of this file's
+ * levels rather than in `CONFIG.audio` with `engineRange`, which is a range.
+ * What it pays for is the near field: the panner's rolloff starts biting at
+ * `CONFIG.audio.engineRef` (8 m — the engine's own plateau, not the one-shot
+ * `refDistance` beside it), so by the time a tank is across a street
+ * it has already taken two thirds of the voice, and the numbers in
+ * `driveEngine` were tuned for a graph with nothing at all in front of it.
+ */
+const HULL_ENGINE_LEVEL = 2.2;
+
+/**
+ * What one KIND of engine is, against the tank's own voice — see
+ * `VehicleSpec.engine`, which is where the two numbers live and carries the
+ * argument for each.
+ *
+ * Restated as a type here rather than imported from the config, because this
+ * file is HANDED one by whoever owns the vehicle and has no business reaching
+ * for a vehicle's block. It is the same bargain `ReportVoice` makes for a
+ * weapon: the caller says what it is, and this file says what that sounds like.
+ */
+export interface EngineKind {
+  /**
+   * Its own slider on the mixer (`CONFIG.mix.channels`), stated per KIND for
+   * `ReportVoice.mix`'s reason: a fourth powerplant carries its own fader and
+   * this file never has to ask which vehicle it is holding. All of them sit
+   * under the one `engine` group.
+   */
+  mix: MixChannel;
+  /**
+   * A multiplier on the rate every pitched layer is a multiple of — a firing
+   * rate on a piston engine, a BLADE rate on a rotor.
+   */
+  revMult: number;
+  /** How much link clatter the voice carries. A tank is 1, a wheeled vehicle 0. */
+  clatter: number;
+  /**
+   * What hangs the machine off a DISC, or null on anything geared to its road
+   * wheels — the same nullable-block bargain `VehicleSpec.flight` makes one
+   * level up, made here for the same reason.
+   *
+   * **The two powerplants are not one set of numbers with different values,
+   * and that is why this is a block and not three more fields.** A piston
+   * engine geared to wheels changes NOTE with what the machine is doing; a
+   * rotor is held at one governed speed and changes only how hard it is
+   * WORKING. `driveEngine` reads this once and takes the other arm.
+   */
+  rotor: {
+    /** Blade passages a second at governed rotor speed: the thump. */
+    slapHz: number;
+    /** The tail rotor's blade passage as a multiple of the main disc's. */
+    tailRatio: number;
+    /** The turbine's governed note, Hz. Answers the SPOOL and not the load. */
+    turbineHz: number;
+  } | null;
+}
+
+/**
+ * The nodes of the tank engine — the one sustained voice in this file, held
+ * open between a mount and a dismount.
+ *
+ * Grouped rather than kept as a dozen fields on the class, because the
+ * teardown has to reach every single one of them: a node added here without a
+ * line in `engineOff` is a source that runs, unheard, for the rest of the
+ * session. `sources` exists for exactly that — everything that was started is
+ * on it, so stopping is a loop rather than a list somebody has to keep in
+ * step.
+ *
+ * Everything named below is something `engineDrive` MOVES. Anything the
+ * throttle does not touch is wired up in `engineOn` and never referred to
+ * again.
+ */
+interface EngineVoice {
+  /**
+   * What KIND of engine this is — the two numbers `VehicleSpec.engine` states,
+   * held on the voice rather than passed per frame.
+   *
+   * Held, because `driveEngine` runs every frame for every hull in earshot and
+   * what a machine IS does not change between them: a graph is built once for
+   * one vehicle and the thing that varies frame to frame is how hard it is
+   * being worked.
+   */
+  kind: EngineKind;
+  /** Everything started, for the one loop that stops it all. */
+  sources: AudioScheduledSourceNode[];
+  /** The output tap: the engine's level, and what takes it off the bus. */
+  out: GainNode;
+  /**
+   * Where in the world this engine is, or null for the hull the player is
+   * sitting in — which is the whole of the difference between the two kinds.
+   * On the teardown list in its own right: `out.disconnect()` leaves a panner
+   * still wired to the master, which is silent but is one more node the graph
+   * never lets go of.
+   */
+  panner: PannerNode | null;
+  /** The firing rate — a BLADE rate on a rotor. Every pitched layer is a multiple. */
+  fire: OscillatorNode;
+  /**
+   * How DEEP the lump chops, and it is on this list because a rotor moves it.
+   *
+   * A piston engine's lump is a fixed depth and its throttle is heard in the
+   * filters; a disc's whole voice is the thump, so what a loaded rotor does is
+   * chop harder rather than open up. Never written on a geared kind, which is
+   * what keeps the two ground vehicles the voice they always were.
+   */
+  fireDepth: GainNode;
+  /** The combustion tone, at twice the firing rate, before its shaper. */
+  growl: OscillatorNode;
+  /** A pure tone at the same pitch: the part of it you feel. */
+  chest: OscillatorNode;
+  /** The turbo's two blades, a few cents apart so they beat. */
+  turbo: [OscillatorNode, OscillatorNode];
+  /** How much of the rumble gets out — opens with load. */
+  chugTone: BiquadFilterNode;
+  /** The same question asked of the combustion tone. */
+  growlTone: BiquadFilterNode;
+  /** The turbo's resonant peak, swept with the spool. */
+  turboTone: BiquadFilterNode;
+  /** The turbo's level. Lagged, and that lag is the whole of the spool. */
+  turboLevel: GainNode;
+  /** Track clatter, gated by how fast the hull is actually moving. */
+  trackLevel: GainNode;
+  /**
+   * The tail rotor, and null on anything without one — which is every kind
+   * whose `EngineKind.rotor` is null. Two nodes rather than one because the
+   * rate spools with the main disc and the level with it.
+   */
+  tail: OscillatorNode | null;
+  tailLevel: GainNode | null;
+}
+
+/**
+ * Which ambience a place in the world makes.
+ *
+ * The world layer names a sound by ID rather than reaching for the audio
+ * config, which is what keeps a building kit describing what a thing IS and
+ * leaves what it SOUNDS like to a table — `MapBuilder`'s `AMBIENCE_KINDS`,
+ * which is a `Record` over this union for the reason `WEAPON_BUILDERS` and
+ * the optics table are: a second kind does not compile half-added.
+ */
+export type AmbienceId = "fire" | "stream" | "shore";
+
+/**
+ * The two ways a body of WATER is heard, and the reason there are two of them
+ * is that they are different sounds rather than the same sound louder.
+ *
+ * Running water is turbulence over a bed: a steady rush whose bubbles ring
+ * around a kilohertz, with a gurgle a few times a second and no bass at all.
+ * Still water is heard only where it meets the land, and what is heard there
+ * is the SWASH — a slow deep swell an octave lower, because a wave entrains
+ * bigger air than a brook does and a bubble's note is `3.26 / r`. `docs/audio.md`
+ * has both fits; `MapBuilder` is where a `WaterRect` names one.
+ *
+ * Derived from `AmbienceId` rather than declared beside it, so a member that
+ * is renamed there stops compiling here instead of quietly meaning nothing.
+ */
+export type WaterAmbienceId = Extract<AmbienceId, "stream" | "shore">;
+
+/**
+ * What a place in the world sounds like — the ambience equivalent of
+ * `EngineKind`, and held as a spec for that field's reason: what a thing
+ * sounds like is a ROW, so a second kind is a second row and never a branch.
+ *
+ * The values live in `CONFIG.audio.ambience`, which is where every number in
+ * the game lives; this is only their shape. Three kinds are built out of it
+ * and no branch anywhere tells them apart — see `Sfx.buildAmbience`, which is
+ * one method for the same reason `buildEngine` is one method for a diesel and
+ * a turbine.
+ *
+ * **The BED is a list and the EVENTS are a list, and between them that is the
+ * whole of the difference between a fire and running water.** A fire is a low
+ * roar, ONE broad hump up top, and crackles carrying most of the mid-high
+ * energy; a brook is TWO humps with only a garnish of gurgle over them.
+ * Trying to build a brook's second hump out of event rows is what proved the
+ * split necessary rather than tidy: an impulse train dense enough to read as
+ * a bed stops being impulses, and measured, the top three octaves came in
+ * 4 to 8 dB under a fit that had them right on paper (`docs/audio.md`).
+ */
+export interface AmbienceKind {
+  /**
+   * Its own slider on the mixer (`CONFIG.mix.channels`), stated per KIND
+   * rather than derived from the id: a bed is one sound a person has an
+   * opinion about, and all three sit under the one `ambience` group.
+   */
+  mix: MixChannel;
+  /** Metres: past this the graph is not built. */
+  range: number;
+  /** Metres: the panner's plateau. */
+  refDistance: number;
+  /** The panner's inverse rolloff. */
+  rolloff: number;
+  /** Level at the plateau. */
+  level: number;
+  /**
+   * The BOTTOM, and the one bed term that is not a hump: a lowpass corner in
+   * Hz and its share. It is flat to DC, which no bandpass is, and that is
+   * what it is for — the fire's column of air and the shore's surf rumble.
+   */
+  roarHz: number;
+  roarLevel: number;
+  /**
+   * The humps, as a LIST. One is a fire, two is running water, and the gaps
+   * between them are left by the filters rather than authored.
+   */
+  bands: readonly BandSpec[];
+  /**
+   * The slow swell: how fast the breath wanders, in Hz. It is the ONE number
+   * behind it now — the loop is `BREATH_SECONDS` of buffer read at
+   * `breathHz / BREATH_WANDER_HZ`, so a slower swell repeats proportionally
+   * later and there is nothing left to state. The shore spends this on the
+   * wave itself, at 0.28.
+   */
+  breathHz: number;
+  /** How deeply the breath swings the bottom. Each hump carries its own. */
+  breathRoarDepth: number;
+  /**
+   * The events, as a LIST — empty is a wind in a canopy, and a further kind
+   * of crackle, gurgle or plop is a further row rather than a branch in
+   * `buildAmbience`.
+   */
+  sparks: readonly SparkSpec[];
+}
+
+/**
+ * One hump in the bed: a bandpass on the shared noise, and how much of it.
+ *
+ * `stages` is how many of that bandpass are put in SERIES, and it buys skirt
+ * steepness rather than narrowness — which is a thing a single biquad cannot
+ * trade for. A brook's spectrum falls about 18 dB an octave below 500 Hz and
+ * only 7 above 2 kHz, and fitted against the recording at third-octave
+ * resolution one stage lands 0.88 dB rms out, two 0.31 and three 0.27: two is
+ * the knee, and the ripple the single stage leaves is a Q of 2.9 poking a
+ * tone through the middle of the plateau. Raising Q instead does not help —
+ * a one-pole skirt is 6 dB an octave however sharp its peak.
+ *
+ * `breath` is this hump's own share of the swell, normalised the way
+ * `SparkSpec.level` is, so it means a depth rather than a magic number. Two
+ * humps do not surge alike: a fire's draught moves the small stuff and the
+ * column barely notices (1.1 against 0.32), where a wave moves the whole body
+ * of water at once and the shore's two are within a third of each other.
+ */
+export interface BandSpec {
+  /** Centre, in Hz. */
+  hz: number;
+  /** Width. Under 1 is broader than an octave. */
+  q: number;
+  /** How many of that bandpass in series. See above: this is SKIRT, not width. */
+  stages: number;
+  /** Share of the mix, and the floor the breath swings about. */
+  level: number;
+  /** This hump's share of the breath, as a fraction of its own level. */
+  breath: number;
+}
+
+/**
+ * One family of crackle: how often, and what it rings.
+ *
+ * `hz` is EVENTS A SECOND and is honoured as one — `sparkThreshold` turns it
+ * into a waveshaper threshold against the context's own sample rate, so the
+ * row means the same thing at 44.1 and 48 kHz. `rate` is what slice of the
+ * shared buffer this chain reads, and its only job is to be different from
+ * every other row's: two chains at the same rate fire on the same samples and
+ * are one louder chain with two filters on it.
+ */
+export interface SparkSpec {
+  /** Events a second. */
+  hz: number;
+  /**
+   * Playback rate, and **it MUST be a negative power of two** — 1, 0.5,
+   * 0.25, 0.125. Any other value is not a slower row, it is a SILENT one.
+   *
+   * A spark's threshold sits within a thousandth of full scale, so what it
+   * selects is isolated single samples. A read position that does not land
+   * exactly on the sample grid interpolates between an extreme sample and
+   * its ordinary neighbour, and that average is always under the threshold —
+   * so the row fires less often, or not at all. Measured, one row stated at
+   * 15 events a second delivered 107% of that at rate 1 and 110% at 0.5, and
+   * then **57% at 0.2, 44% at 1/7, 21% at 1/3 and NOTHING AT ALL at 0.37 or
+   * 0.61.** Only rates that are exact in binary keep the position on the
+   * grid; 1/3 is not 0.333… in a float and the position drifts off it.
+   *
+   * This shipped as 0.61 in the second cut of this graph, which meant the
+   * whole second row was silent and the fire was one pitch repeated — the
+   * exact failure the row list exists to prevent, hidden behind numbers that
+   * measured well because the surviving row was carrying them. `buildAmbience`
+   * warns about it in a DEV build.
+   */
+  rate: number;
+  /**
+   * Seconds of the shared buffer this row reads before it repeats, so its
+   * own cycle is `loop / rate` and no two rows share one.
+   *
+   * The buffer is one second long and a row at rate 1 therefore repeats its
+   * whole pattern of crackles every second, which is a rhythm, and the
+   * reason rate 1 is not used by any row. Rounded to a whole
+   * number of SAMPLES at build time: a fractional loop leaves the read
+   * position on a fraction after its first wrap, which is the silent failure
+   * above arriving by a different door.
+   */
+  loop: number;
+  /** The resonance an impulse rings, and how long it rings for. */
+  ringHz: number;
+  ringQ: number;
+  level: number;
+}
+
+/**
+ * Points in a spark's transfer table. See `Sfx.sparkShape`: a crackle's rate
+ * is a threshold near the very tip of the noise's range, so this is the
+ * resolution of that rate and the usual 1024 cannot express one.
+ */
+const SPARK_CURVE_POINTS = 32768;
+
+/**
+ * Events a second → the sample value a crackle has to exceed.
+ *
+ * White noise is uniform on [-1, 1], so the share of samples past a threshold
+ * `t` is `1 - t` on each tip and the chain fires at `sampleRate * rate *
+ * (1 - t)`. Inverting that is the whole function, and it is a function rather
+ * than a constant because the answer depends on a device's own sample rate:
+ * a threshold that gives fifteen crackles a second at 48 kHz gives sixteen
+ * and a half at 44.1, and hard-coding one would be a fire that burns at a
+ * different speed on different hardware.
+ *
+ * Clamped well short of 1 so a badly-stated row is a busy fire rather than a
+ * table with no events in it at all.
+ */
+function sparkThreshold(hz: number, sampleRate: number, rate: number): number {
+  const share = hz / Math.max(1, sampleRate * rate);
+  return Math.min(0.9999, Math.max(0, 1 - share));
+}
+
+/**
+ * One emitter's nodes — `EngineVoice`'s much shorter cousin, and short for a
+ * reason worth stating: everything an engine holds on that interface is
+ * something the throttle MOVES, and nothing moves here. A fire is not being
+ * worked, so the only things this has to keep are the three needed to take it
+ * away again.
+ *
+ * `sources` carries the same rule it carries there: everything started is on
+ * it, so stopping is a loop rather than a list somebody has to keep in step.
+ * The panner is on it in its own right because `out.disconnect()` would leave
+ * one wired to the master — silent, and never collected.
+ */
+interface AmbienceVoice {
+  sources: AudioScheduledSourceNode[];
+  out: GainNode;
+  panner: PannerNode;
+}
+
+/**
+ * Procedural sound effects via WebAudio — no audio assets.
+ *
+ * Three things here exist because of the jump from a twelve-enemy arena to a
+ * thirty-two-bot battlefield:
+ *
+ * - **One cached noise buffer.** Filling a fresh `AudioBuffer` per shot meant
+ *   ~1,900 `Math.random()` calls each time; with a full firefight that was
+ *   hundreds of buffer allocations a second on the main thread. Now a single
+ *   one-second buffer is generated on unlock and every burst plays a random
+ *   slice of it.
+ * - **Positional playback.** A distant firefight has to sit behind you rather
+ *   than in your ear, so world-space sounds run through a `PannerNode` with
+ *   distance rolloff and are dropped entirely past `maxDistance`.
+ * - **A voice cap.** Sixteen bots at five rounds a second is ~80 gunshots
+ *   a second. Beyond `maxVoices` concurrent one-shots, new ones are skipped —
+ *   the ear cannot pick them apart anyway, and the scheduler can't keep up.
+ *
+ * **Gunfire is noise, not tone.** Every layer of a shot is a filtered slice of
+ * the shared noise buffer; the single pitched oscillator left in a report is
+ * the low chest thump, which genuinely is one frequency. An oscillator at any
+ * audible pitch reads as a beep however it is enveloped, and that — more than
+ * spectrum or envelope — is what made synthesized gunfire sound like a toy.
+ *
+ * **The tail is the reverb, not the shot.** Outdoors, a rifle is a two
+ * millisecond transient followed by a quarter second of the village answering
+ * it. That answer is one shared `ConvolverNode` on a send, so it costs nothing
+ * per shot and, crucially, is not a voice: eighty shots a second all decay
+ * through the same bus instead of eighty tail voices fighting over the cap.
+ */
+/**
+ * One family's pair of taps, and the reason a fader is a NODE rather than a
+ * number folded into a level.
+ *
+ * A sound reaches the output twice — dry through its panner and wet through
+ * the shared convolver, which `send` taps PRE-panner and which therefore
+ * bypasses anything sitting between a panner and the master. So a fader
+ * applied on one path only would take a family's direct sound away and leave
+ * the village still answering it, which at this game's send levels is most of
+ * what a distant shot IS. Two nodes carrying the same number is the whole
+ * fix, and it is why every layer helper here is handed a bus rather than a
+ * scalar.
+ *
+ * Both are held for the life of the context and neither is ever rebuilt: a
+ * fader is a `gain.value` write on two nodes (`Sfx.setMix`), which is what
+ * makes the dev mixer's slider audible on the sustained voices — an engine,
+ * a fire — as well as on the one-shots that are rebuilt per trigger anyway.
+ */
+export interface MixBus {
+  /** Into the master, after the panner. */
+  dry: GainNode;
+  /** Into the shared convolver, and the `send` tap's only destination. */
+  wet: GainNode;
+}
+
+export class Sfx {
+  private ctx: AudioContext | null = null;
+  private master: GainNode | null = null;
+  /**
+   * One `MixBus` per family, built with the context and never rebuilt.
+   *
+   * Null before `unlock`, which is the single check every layer helper makes
+   * instead of the `this.master` test it used to: a bus implies a master, and
+   * a null one is the audio graph not existing yet rather than a group that
+   * went missing.
+   */
+  private groupBuses: Record<MixGroup, MixBus> | null = null;
+  /**
+   * One bus per (channel, GROUP) pair that `CHANNEL_GROUPS` declares, chained
+   * into that group's own.
+   *
+   * **A pair rather than a channel, because the two tiers are not a tree.** A
+   * weapon is one fader and is heard under `ownGun` in your hands and
+   * `worldGun` out in the street, so its fader has to exist at two points in
+   * the graph — `setChannel` writes the value to every one of a channel's
+   * buses, which is what keeps "the sniper is quiet" one slider while leaving
+   * "everybody else's guns are loud" a different one.
+   *
+   * `Partial` because most channels are heard exactly one way, and a pair
+   * nobody declared is a pair nothing can play through: `bus` returns null and
+   * the layer helpers refuse, the same refusal they make before `unlock`.
+   */
+  private channelBuses:
+    | Record<MixChannel, Partial<Record<MixGroup, MixBus>>>
+    | null = null;
+  /**
+   * Where each fader currently stands, seeded from `CONFIG.mix`.
+   *
+   * Held beside the nodes rather than read back off them because the dev
+   * mixer has to be able to state what it is about to write to disk, and a
+   * `gain.value` is the wrong place to keep that — it is a scheduled
+   * parameter, and reading one back after a ramp is a promise this file does
+   * not want to make.
+   */
+  private groupFader: Record<MixGroup, number> = { ...CONFIG.mix.groups };
+  private channelFader: Record<MixChannel, number> = { ...CONFIG.mix.channels };
+  /**
+   * The DRIVEN vehicle's engine — the unpanned one. Null whenever the player
+   * is on foot. See `engineOn`.
+   */
+  private engine: EngineVoice | null = null;
+  /**
+   * Everybody else's, keyed by whatever the caller uses to tell one hull from
+   * another. Held open for exactly as long as that hull is occupied, alive and
+   * within `CONFIG.audio.engineRange` — see `hullEngine`, which is called every
+   * frame rather than on a mount, and `enginesOff`, which is what a frame that
+   * did not step the fleet at all owes.
+   */
+  private hullVoices = new Map<number, EngineVoice>();
+  /**
+   * The world's sustained emitters, keyed by whatever the caller uses to tell
+   * one from another — `AmbienceSystem` uses the emitter's index, which is
+   * stable for the life of a map, so a fire keeps its own voice as the
+   * ranking around it changes.
+   *
+   * Held open for as long as the caller keeps asking and the emitter stays
+   * inside its kind's `range`. See `ambience`, which is called every frame
+   * rather than when something is lit, and `ambienceAllOff`, which is owed by
+   * a map being torn down and — unlike `enginesOff` — by nothing else.
+   */
+  private ambienceVoices = new Map<number, AmbienceVoice>();
+  /**
+   * The gate's transfer curves by threshold, built on the first emitter of
+   * each kind and shared after that, for the reason `growlCurve` is. A map
+   * rather than a field because a second ambience kind is a second threshold,
+   * and the whole point of the spec is that adding one costs no code here.
+   */
+  private sparkCurves = new Map<number, Float32Array<ArrayBuffer>>();
+  /**
+   * The combustion shaper's curve: built on the first mount and shared by
+   * every one after it, for the reason the noise buffer is.
+   */
+  private growlCurve: Float32Array<ArrayBuffer> | null = null;
+  private listener: AudioListener | null = null;
+  /** Reused by every `burst()` call; built once on unlock. */
+  private noiseBuffer: AudioBuffer | null = null;
+  /**
+   * The ambience BREATH's wander, pre-smoothed and built once — see
+   * `buildBreathBuffer`, which is where the argument for holding it as a
+   * buffer rather than filtering noise live is written down.
+   */
+  private breathBuffer: AudioBuffer | null = null;
+  /** The shared environment reverb every gunshot sends into. */
+  private reverb: ConvolverNode | null = null;
+  /**
+   * The decoded recordings, by id — see `src/core/samples.ts`. Empty until the
+   * fetches land and empty forever if they fail, which is not an error state:
+   * a weapon whose sample is missing is heard as the synthesized report, so
+   * this map being empty is the game as it shipped for its whole life.
+   */
+  private samples = new Map<SampleId, LoadedSample>();
+  /** So a second `unlock()` — every pointer gesture is one — refetches nothing. */
+  private samplesRequested = false;
+  /** Currently-playing one-shots, for the voice cap. */
+  private voices = 0;
+  /** True while the game is paused and the context is suspended. */
+  private paused = false;
+  /** Last listener position, for propagation delay and air absorption. */
+  private lx = 0;
+  private ly = 0;
+  private lz = 0;
+  /** Audio-clock time of the last impact, for that method's own rate limit. */
+  private lastImpact = 0;
+  /**
+   * Audio-clock time of the last FULL near miss — see `nearMiss`, whose rate
+   * limit drops its three supporting layers and never its snap.
+   */
+  private lastNearMiss = 0;
+
+  unlock(): void {
+    if (!this.ctx) {
+      try {
+        this.ctx = new AudioContext();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = 1;
+        // A firefight sums twenty-odd voices, and un-limited that is digital
+        // clipping — the crackle reads as a broken speaker, not as loud.
+        //
+        // This is a **static soft clip, deliberately not a
+        // `DynamicsCompressor`.** Measured: Chrome's compressor took a shot's
+        // 0.45 transient down to 0.07, and — because its detector barely
+        // engages on an isolated click — left a reload louder than the rifle
+        // that needed it. Any envelope follower has that failure mode against
+        // impulsive material: it ducks the very leading edge that makes a
+        // gunshot sound like one. A `tanh` curve has no time constants at all,
+        // so anything below saturation passes at exactly unity and only the
+        // sums that would have clipped are bent.
+        const clip = this.ctx.createWaveShaper();
+        const curve = new Float32Array(1024);
+        for (let i = 0; i < curve.length; i++) {
+          const u = (i / (curve.length - 1)) * 2 - 1;
+          curve[i] = Math.tanh(u * SOFT_CLIP_DRIVE);
+        }
+        clip.curve = curve;
+        clip.oversample = "4x";
+        // The pre-gain maps ±SOFT_CLIP_DRIVE of input across the curve, which
+        // is what makes the small-signal slope unity.
+        const pre = this.ctx.createGain();
+        pre.gain.value = 1 / SOFT_CLIP_DRIVE;
+        this.master.connect(pre).connect(clip).connect(this.ctx.destination);
+        // The reverb is a send: dry stays at full level and wet is mixed in
+        // alongside it, joining the dry path at the soft clip so the two are
+        // saturated together rather than separately.
+        this.reverb = this.ctx.createConvolver();
+        const wet = this.ctx.createGain();
+        wet.gain.value = CONFIG.audio.reverbMix;
+        this.reverb.connect(wet).connect(pre);
+        // The mixer, in two tiers, between everything this file builds and
+        // the two things it all ends up in. Built here rather than lazily so
+        // that no sound can be the one that creates its own bus and so that
+        // neither setter has to ask whether a family has been heard yet.
+        //
+        // ~110 gain nodes, made once per process and never rebuilt. That is
+        // nothing against a graph that stands up six sources for one engine,
+        // and it is what buys a fader that moves a voice already sounding.
+        const groups = {} as Record<MixGroup, MixBus>;
+        for (const g of MIX_GROUPS) {
+          groups[g] = this.makeBus(this.groupFader[g], this.master, this.reverb);
+        }
+        const channels = {} as Record<
+          MixChannel,
+          Partial<Record<MixGroup, MixBus>>
+        >;
+        for (const c of MIX_CHANNELS) {
+          const under: Partial<Record<MixGroup, MixBus>> = {};
+          // Only the pairs `CHANNEL_GROUPS` declares. A channel heard one way
+          // gets one bus; a weapon gets two, carrying one number.
+          for (const g of CHANNEL_GROUPS[c]) {
+            under[g] = this.makeBus(
+              this.channelFader[c],
+              groups[g].dry,
+              groups[g].wet,
+            );
+          }
+          channels[c] = under;
+        }
+        this.groupBuses = groups;
+        this.channelBuses = channels;
+        this.listener = this.ctx.listener;
+        this.buildNoiseBuffer();
+        this.buildBreathBuffer();
+        this.buildImpulse();
+        // Fire-and-forget, and deliberately not awaited by anything: `unlock`
+        // is called from a pointer gesture and the first shot may well be
+        // fired before the decode lands. That shot is the synthesized report,
+        // which is what makes the sample a preference rather than a load-
+        // bearing asset — see `samples.ts`.
+        void this.loadSamples();
+      } catch {
+        this.ctx = null;
+      }
+    }
+    if (this.ctx && this.ctx.state === "suspended" && !this.paused) {
+      void this.ctx.resume();
+    }
+  }
+
+  /**
+   * Freezes or thaws the whole graph — an OFFLINE pause menu, and nothing
+   * else. A networked round is still being played by everybody else and is
+   * still sounding off the wire while its card is up, so `Game.pause` leaves
+   * this alone there: a stopped clock would neither play those nor let them
+   * end, and they would all arrive together on the resume.
+   *
+   * Suspending the context rather than muting a gain is what makes this
+   * correct for free: anything already scheduled (the tail of the shot that
+   * was in the air, a reload two clacks in) stops where it is and carries on
+   * from there, and the `voices` counter stays honest because nothing ends
+   * while the clock is stopped.
+   *
+   * The flag is also what stops `unlock()` from thawing it behind our back:
+   * the click on the pause menu is a pointer gesture like any other, and Game
+   * unlocks audio on every one of those.
+   */
+  setSuspended(on: boolean): void {
+    if (this.paused === on) return;
+    this.paused = on;
+    if (!this.ctx) return;
+    void (on ? this.ctx.suspend() : this.ctx.resume());
+  }
+
+  /** One pair of taps at `value`, feeding a dry destination and a wet one. */
+  private makeBus(value: number, dry: AudioNode, wet: AudioNode): MixBus {
+    const ctx = this.ctx as AudioContext;
+    const d = ctx.createGain();
+    d.gain.value = value;
+    d.connect(dry);
+    const w = ctx.createGain();
+    w.gain.value = value;
+    w.connect(wet);
+    return { dry: d, wet: w };
+  }
+
+  /**
+   * Where one sound lands: its channel's taps under the group it is being
+   * heard in, and the first line of every method here that makes a noise.
+   *
+   * Null before `unlock` and never null after it for a declared pair, so a
+   * caller that reads it into a local and hands that local to every layer it
+   * builds is correct either way — the helpers all refuse a null bus, which is
+   * the same refusal they used to make against a null master.
+   *
+   * **It is a LOCAL and never a field**, which is what makes it safe for a
+   * gesture that finishes on a timer: `capture` schedules its second tone
+   * 130 ms later, and a field would by then be holding whatever went off in
+   * between. A local is captured by the closure and cannot be overwritten by
+   * another sound.
+   */
+  private bus(c: MixChannel, g: MixGroup): MixBus | null {
+    return this.channelBuses?.[c][g] ?? null;
+  }
+
+  /**
+   * Moves one FAMILY's fader, live — the dev mixer, and nothing else in the
+   * game calls it.
+   *
+   * Ramped over a few milliseconds rather than assigned: a `gain.value` write
+   * lands between two samples, and a slider dragged across a sustained fire
+   * would otherwise be a string of clicks.
+   */
+  setGroupMix(g: MixGroup, value: number): void {
+    this.groupFader[g] = value;
+    this.ramp(this.groupBuses?.[g], value);
+  }
+
+  /**
+   * Moves one SOUND's fader, live — and writes it to every bus that channel
+   * has, which is two for a weapon and one for everything else. One number,
+   * however many places in the graph it has to exist.
+   */
+  setChannelMix(c: MixChannel, value: number): void {
+    this.channelFader[c] = value;
+    const under = this.channelBuses?.[c];
+    if (!under) return;
+    for (const g of CHANNEL_GROUPS[c]) this.ramp(under[g], value);
+  }
+
+  private ramp(b: MixBus | undefined, value: number): void {
+    if (!b || !this.ctx) return;
+    const t = this.ctx.currentTime;
+    b.dry.gain.setTargetAtTime(value, t, 0.01);
+    b.wet.gain.setTargetAtTime(value, t, 0.01);
+  }
+
+  /**
+   * What every fader is PLAYING at, which is not quite the same question as
+   * what it is worth.
+   *
+   * This file knows one number per group and one per channel, and they are the
+   * ones on the nodes. A mixer that mutes or solos is pushing a zero through
+   * here while holding the fader it will eventually save, and that split lives
+   * in the panel — see `dev/mixer`, whose `dispose` puts the faders back
+   * before it lets go, which is what makes this an honest seed for the next
+   * panel that opens.
+   */
+  mixGains(): { groups: Record<MixGroup, number>; channels: Record<MixChannel, number> } {
+    return { groups: { ...this.groupFader }, channels: { ...this.channelFader } };
+  }
+
+  /**
+   * Points the audio listener at the camera. Called once per frame, after the
+   * camera has moved — same ordering rule as the lighting and fog uniforms.
+   */
+  setListener(position: Vector3, forward: Vector3): void {
+    const l = this.listener;
+    if (!l || !this.ctx) return;
+    this.lx = position.x;
+    this.ly = position.y;
+    this.lz = position.z;
+    const t = this.ctx.currentTime;
+    // Firefox still only implements the deprecated setters.
+    if (l.positionX) {
+      l.positionX.setValueAtTime(position.x, t);
+      l.positionY.setValueAtTime(position.y, t);
+      l.positionZ.setValueAtTime(position.z, t);
+      l.forwardX.setValueAtTime(forward.x, t);
+      l.forwardY.setValueAtTime(forward.y, t);
+      l.forwardZ.setValueAtTime(forward.z, t);
+      l.upX.setValueAtTime(0, t);
+      l.upY.setValueAtTime(1, t);
+      l.upZ.setValueAtTime(0, t);
+    } else {
+      (l as unknown as { setPosition(x: number, y: number, z: number): void })
+        .setPosition(position.x, position.y, position.z);
+      (l as unknown as {
+        setOrientation(...a: number[]): void;
+      }).setOrientation(forward.x, forward.y, forward.z, 0, 1, 0);
+    }
+  }
+
+  // --- player-local one-shots (always 2D, always audible) ---
+
+  /**
+   * The player's own weapon, at the player's own ear. Five layers plus the
+   * shared reverb, in the order the ear resolves them: the snap of the shock
+   * front, the body of the report, a low roll under it, the chest thump, and
+   * the action cycling a beat later.
+   *
+   * **This method owns the SHAPE of a gunshot and the weapon owns nothing but
+   * deviations from it** (`ReportVoice`, tabled in `CONFIG.weapons[id].report`
+   * with what each field means). That split is the same one `recoilMult` makes
+   * against `CONFIG.recoil`, and it is what the six guns sounding identical
+   * cost: the only thing a weapon could say used to be `sfxPitch`, one
+   * multiplier over every frequency, which can make a big gun a small gun
+   * slowed down and nothing else. How much charge is behind the round, how
+   * long the report rings, how hard it drives the village and how loud the
+   * mechanism is against the shot are what actually separate an SMG from a
+   * DMR, and none of them had anywhere to be said.
+   *
+   * **The two low layers are where "heavy" lives, and they are separate on
+   * purpose.** The roll is broadband noise under a resonant lowpass — the gas
+   * column, which has no pitch — and the thump is the one pitched oscillator
+   * this class allows itself, because the pressure pulse genuinely is a single
+   * frequency. Either alone is thin: noise without the sine is a rumble with
+   * no centre, and the sine without the noise is a kick drum. The roll's raw
+   * gain looks enormous beside the others and is not — a lowpass at 360 Hz
+   * throws away all but about a tenth of a noise slice's amplitude, the same
+   * arithmetic the body layer and every footstep in here are written against.
+   *
+   * **These five layers are the one sound in the game exempt from the voice
+   * cap** (`keep`), and it is the impact reserve's argument taken one step
+   * further. The cap is first-come-first-served, so the firefight loud enough
+   * to spend it is exactly the moment the player's own weapon would come out
+   * thin — the roll, the thump and the action are scheduled last and would be
+   * the three dropped, which is to say the gun would lose its bottom end
+   * precisely when it is being fired in anger. The exemption is bounded by
+   * construction rather than by trust: ONE shooter, five layers, and a rate the
+   * weapon table caps. Computed over every weapon's whole magazine held down,
+   * the worst case is TEN — the carbine, whose three rounds inside 0.1 s stack
+   * deeper than the LMG's nine or the rifle's seven — against a cap of 24 with
+   * 6 of those already reserved from impacts. They are still COUNTED, so
+   * everything else still yields to them.
+   *
+   * **`at` is a scheduling offset in seconds, and every layer takes it** —
+   * including the action's own delay, which rides on top of it rather than
+   * replacing it. It is how the player's own report is put back where the
+   * round was DUE rather than on the frame boundary it could be fired on; the
+   * caller owns the number (`Player.reportDelay`) and the argument is 0 for
+   * every other shooter in the game, whose cadence nothing is listening to.
+   */
+  shoot(voice: ReportVoice = FLAT_REPORT, at = 0): void {
+    const bus = this.bus(voice.mix ?? "otherGun", "ownGun");
+    // Two rounds from the same weapon are never the same report, and eight a
+    // second of one recording is the loudest tell that a gun is synthesized.
+    const v = 0.92 + Math.random() * 0.16;
+    // A recording stands in for all five layers, and `v` is spent on it the
+    // same way — a sample fired eight times a second is the sentence above
+    // describing itself, so the per-shot wobble matters MORE here than it does
+    // to the synthesis, which varies its own noise slice as well. `keep` for
+    // the reason the five layers have it: this is the player's own report.
+    //
+    // **`pitch` is deliberately NOT spent on it, and `v` alone is.** The eight
+    // scalars are DEVIATIONS from the reference report — that is the whole
+    // shape of `ReportVoice`, and why the rifle's row is all ones — so `pitch`
+    // says "this weapon's bore and charge, against the rifle's". A recording
+    // of that weapon has already said it. Bending it again is the deviation
+    // applied twice, and at this table's spread it is not subtle: the SMG's
+    // 1.42 would play its own file a fourth high and 41 ms short, the sniper's
+    // 0.6 would stretch a 130 ms boom to 217. `level` still applies, because
+    // a level is a mix decision rather than a claim about the weapon, and
+    // `tail` still applies, because how hard a shot drives the VILLAGE is the
+    // game's question and not the recording's. `snap`, `weight` and `length`
+    // are the three the file genuinely subsumes and are simply not read.
+    if (voice.sample && this.sample(bus, voice.sample, {
+      vol: SAMPLE_LEVEL * voice.level, rate: v,
+      // A plain send level like the five layers it replaces — the wet bus's
+      // own `reverbMix` is downstream of all of them. The five sum to ~3.25
+      // of these and this is 1.0, because those levels are set against layers
+      // a lowpass has already thrown most of the amplitude away from and this
+      // one is the file at full scale.
+      send: voice.tail, keep: true, delay: at,
+    })) return;
+    const f = v * voice.pitch;
+    const lvl = voice.level;
+    // How long the report rings on. Scales the three layers that have a decay
+    // worth the name; the snap has none and the action is a click.
+    const len = voice.length;
+    const tail = voice.tail;
+    // The snap: the shock front, above 3.6 kHz, over in seven milliseconds.
+    // This is the layer that reads as violent rather than as loud, and it is
+    // why the DMR is not just the rifle an octave down — it has the deepest
+    // body here AND the sharpest edge.
+    this.burst(bus, {
+      dur: 0.007, vol: 0.68 * v * lvl * voice.snap, type: "highpass",
+      freq: 3600 * f, q: 1, send: 0.2 * tail, keep: true, delay: at,
+    });
+    // The body of the report, sweeping down as the gas column collapses. A
+    // lowpass throws away most of a noise slice's amplitude, so its gain is
+    // set well above the level it actually plays at.
+    this.burst(bus, {
+      dur: 0.1 * len, vol: 0.74 * lvl, type: "lowpass", freq: 2600 * f,
+      freqEnd: 340 * voice.pitch, send: 0.9 * tail, keep: true, delay: at,
+    });
+    // The low roll: the gas leaving the muzzle, under a lowpass with enough
+    // resonance to put a peak where a small speaker can still find it. Sent
+    // hardest of the five, because outdoors the low end of a shot is mostly
+    // the village answering it.
+    this.burst(bus, {
+      dur: 0.26 * len, vol: 1.75 * lvl * voice.weight, type: "lowpass",
+      freq: 360 * voice.pitch, freqEnd: 95 * voice.pitch, q: 3,
+      send: 1.2 * tail, keep: true, delay: at,
+    });
+    // Chest thump: the low pressure wave, and the one part of a gunshot that
+    // really is a single frequency. A sine's peak is its gain exactly.
+    this.tone(bus, 150 * f, 0.16 * len, "sine", 0.32 * lvl * voice.weight, 0.34, null, {
+      send: 0.7 * tail, keep: true, delay: at,
+    });
+    // The action riding home, behind the shot rather than under it — mechanism,
+    // so it sits far below the blast. A light bolt comes back sooner as well as
+    // higher, which is why the delay is divided by the same number that pitches
+    // it: the SMG's is thirty milliseconds and the LMG's is sixty-six.
+    this.burst(bus, {
+      dur: 0.04, vol: 0.18 * lvl * voice.actionVol, type: "bandpass",
+      freq: 2900 * voice.actionPitch, q: 1.3,
+      delay: at + 0.045 / voice.actionPitch, send: 0.25 * tail, keep: true,
+    });
+  }
+
+  /** Hitmarker: a chunky two-part "thock", not a beep. */
+  hit(): void {
+    const bus = this.bus("hitmarker", "feedback");
+    this.tone(bus, 520, 0.05, "square", 0.07, 0.7);
+    this.burst(bus, { dur: 0.025, vol: 0.12 });
+  }
+
+  /**
+   * The headshot. Higher and cleaner than `hit()` and built the opposite way:
+   * where the body hit is a square wave and a noise slice — deliberately
+   * blunt, a thing striking a thing — this is two sines an octave apart with
+   * the upper one late, which has no noise in it at all and so cuts through a
+   * burst of ordinary markers instead of merging into them.
+   *
+   * That separation is the whole job. A headshot at full auto is worth nothing
+   * as feedback if it sounds like the shots either side of it, and the marker
+   * cannot carry it alone: `flashHitmarker` lets a kill outrank a head hit on
+   * screen precisely because the ear is where this read lands.
+   *
+   * Both layers are brief and unsent — a headshot is confirmation, and giving
+   * it a tail would put it in the same space as the report that caused it.
+   */
+  headshot(): void {
+    const bus = this.bus("headshot", "feedback");
+    this.tone(bus, 1180, 0.055, "sine", 0.085, 1);
+    this.tone(bus, 2360, 0.09, "sine", 0.05, 1, null, { delay: 0.03 });
+    this.burst(bus, { dur: 0.018, vol: 0.06, type: "highpass", freq: 4200, q: 0.7 });
+  }
+
+  /**
+   * A round cracking past the player's head. Not a hit and not a hit sound —
+   * the supersonic N-wave, which arrives *before* the report of the rifle that
+   * fired it and is the only thing that tells you you are being shot at rather
+   * than shot near. Wired from `CombatSystem.onNearMiss` for the player only
+   * offline, and from the authority's `nearmiss` event in a match — ONE method
+   * for both, so the two simulations cannot make different noises about the
+   * same round.
+   *
+   * **FIVE LAYERS MODELLED ON A RECORDED FLYBY**, and the shape they make
+   * between them is the whole of why this is no longer one bandpassed burst.
+   * The recording is four stages rather than a click: a whistle SWELLING for
+   * ~55 ms, a snap whose energy sits at 500–1300 Hz under a bright shelf that
+   * runs flat out to 13 kHz, a low body around 320 Hz over the 60 ms after it,
+   * and a hiss departing over a further ~200 ms. The old single burst was
+   * centred at 3400 Hz with neither the approach nor the tail, which is the
+   * difference between a round going past and a twig snapping — what the ear
+   * reads as a projectile is the swell and the departure, and a bright
+   * transient on its own is just a transient.
+   *
+   * **The layers OVERLAP rather than abut, and that is the constraint the
+   * numbers were fitted under.** `burst`'s decay is percussive by design — it
+   * is 57 dB down by the end of its own `dur` — so laying these end to end
+   * left audible holes between the stages and the cue read as three separate
+   * events. Each layer now starts inside the one before it, and the summed
+   * envelope falls monotonically from the snap to silence, within 2–4 dB of
+   * the recording the whole way down.
+   *
+   * **The SWELL is the one thing here that looks like added latency and is
+   * not.** It sits in front of the snap, but its own onset is still this frame
+   * and 15 dB down, so what it delays is the loudest moment rather than the
+   * cue — and the snap still lands well before the report of the rifle that
+   * sent it, which is the ordering that matters. A shock front physically has
+   * no approach; this is the recorded convention, and the recording is the
+   * model that was asked for.
+   *
+   * **The pan is STATIC even though the recording passes right to left**, and
+   * that is a decision rather than a shortfall. `at` is the point of closest
+   * approach and nothing here knows which way the round was travelling, so a
+   * sweep would be wrong half the time — and WHICH SIDE is the only part of
+   * this cue a player can act on. A blurred bearing costs more than a missing
+   * Doppler.
+   */
+  nearMiss(at: Vector3): void {
+    const bus = this.bus("nearMiss", "impact");
+    if (!this.ctx) return;
+    const v = 0.9 + Math.random() * 0.2;
+    // Panned from the point of closest approach, so the crack says WHICH SIDE
+    // as well as "you are being shot at" — which is the difference between a
+    // cue you can act on and one that only raises your pulse. It was mono for
+    // as long as it existed, and it is the most urgent sound in the game.
+    const panner = this.panner(bus, at);
+    // **The SNAP is never rate-limited and the other three always are**, which
+    // is the opposite way round from `impact` and is why the gate sits here
+    // rather than at the top of the method. A burst walked onto the player is
+    // a string of these, and at five layers over 300 ms a second of that would
+    // hold more voices than the whole budget — the snap included, since
+    // `burst` refuses at the cap. Overlapping swells and tails are mud anyway;
+    // what the ear separates in a string is the snaps, so those are what
+    // survive.
+    const now = this.ctx.currentTime;
+    const full = now - this.lastNearMiss >= CONFIG.audio.nearMissInterval;
+    if (full) this.lastNearMiss = now;
+
+    // 1. THE APPROACH. Noise swelling into the snap and sliding DOWN through
+    //    it — the recording's whistle peaks at 1009 Hz before the pass and its
+    //    snap at 635, and that fall is the Doppler. It is what says the thing
+    //    was MOVING rather than merely loud, and it is the reason `burst` has
+    //    a `rise` at all.
+    if (full) {
+      this.burst(bus, {
+        dur: 0.082, rise: 0.052, vol: 0.32, type: "bandpass",
+        freq: 1500 * v, freqEnd: 820, q: 1.4, out: panner,
+      });
+    }
+    // 2. THE SNAP, and it is LOW. The loudest moment in the recording is at
+    //    635 Hz, not the 3400 this used to be built at, which is most of what
+    //    was wrong with the one-layer version. It runs long and sweeps to 300
+    //    so its own second stage becomes the low ring the tail sits on.
+    this.burst(bus, {
+      dur: 0.115, vol: 0.32, type: "bandpass", freq: 760 * v, freqEnd: 300,
+      // No propagation delay beyond the swell's own, and that is the entire
+      // point of the N-wave: it arrives BEFORE the report of the rifle that
+      // sent it. The point is inside 1.9 m (`hitRadius` + `suppressRadius`)
+      // anyway, where the delay would be five milliseconds. Send is small for
+      // the same reason — a crack past your head is direct sound, not the
+      // valley answering.
+      q: 1.1, send: 0.15, out: panner, delay: 0.052,
+    });
+    // 3. THE SNAP'S BRIGHT EDGE, and it has to be its own layer: the
+    //    recording's shelf is flat from 4 to 13 kHz through the snap, and no
+    //    single bandpass wide enough to hold 635 Hz also delivers that.
+    //    Shorter than the body of the snap, because the top goes first.
+    this.burst(bus, {
+      dur: 0.03, vol: 0.065, type: "highpass", freq: 3600 * v, q: 0.7,
+      out: panner, delay: 0.052,
+    });
+    if (!full) return;
+    // 4. THE BODY. 320 Hz is the recording's dominant band for the 60 ms after
+    //    the snap, and this layer is what holds the middle of the decay up —
+    //    without it the cue falls 13 dB below the recording by 100 ms and
+    //    stops sounding like anything with mass in it.
+    this.burst(bus, {
+      dur: 0.26, vol: 0.165, type: "bandpass", freq: 360 * v, freqEnd: 230,
+      q: 1.6, send: 0.1, out: panner, delay: 0.058,
+    });
+    // 5. THE DEPARTURE. The recording's last 200 ms peak at 10 kHz — that is
+    //    air leaving, not shock — so this is hiss and nothing else, and unsent
+    //    because a tail into the shared reverb would be the valley answering a
+    //    round that never touched it.
+    this.burst(bus, {
+      dur: 0.3, vol: 0.055, type: "highpass", freq: 7000 * v, q: 0.7,
+      out: panner, delay: 0.062,
+    });
+  }
+
+  enemyDie(): void {
+    const bus = this.bus("enemyDie", "feedback");
+    this.tone(bus, 300, 0.25, "sawtooth", 0.06, 0.3);
+  }
+
+  playerHurt(): void {
+    const bus = this.bus("playerHurt", "feedback");
+    this.tone(bus, 110, 0.2, "sawtooth", 0.08, 0.7);
+  }
+
+  /**
+   * Working the magazine: catch, magazine out, fresh magazine seated, bolt
+   * released. Four beats, spaced across the *actual* reload so the animation's
+   * end lands on the bolt rather than on silence — which is why the offsets
+   * are fractions of the config value and not absolute times.
+   *
+   * **The weapon's own mechanism voices them** (`ReportVoice.actionPitch` and
+   * `actionVol`, the same pair that pitches the action inside `shoot`), so a
+   * belt going into an LMG and a magazine going into a pistol are not one
+   * sound at two speeds. The TIMING is untouched by it: those four fractions
+   * are keyed to `ViewModel`'s reload beats to the frame, and a change to one
+   * is a change to the other — see `docs/weapons.md`.
+   *
+   * **The middle two beats are RECORDED and the outer two are not, and which
+   * is which was decided by the master rather than chosen.**
+   * `audio/src/reload.wav` holds a magazine stripped out of a well and a fresh
+   * one slapped home, 2.4 s apart with the fetch for it in between; the catch
+   * and the bolt are not cleanly in it and are still the clacks they always
+   * were. A sample that is missing — not fetched, not decoded, not supported
+   * by the browser — falls back to the clack it replaced, exactly as `shoot`
+   * falls back to its five synthesized layers, so this method is the same four
+   * beats either way.
+   *
+   * **`actionPitch` IS spent on these two, which inverts the rule `shoot`
+   * obeys and is the same argument read from the other end.** A report's file
+   * is a recording of THAT weapon and has already made the deviation, so
+   * bending it again applies it twice. One magazine recording is shared by
+   * every weapon in the kit and has said nothing at all about which one it is
+   * going into — so `actionPitch`, the field whose whole job is telling a belt
+   * from a pistol magazine, is what it still has to be told.
+   */
+  reload(duration: number, voice: ReportVoice = FLAT_REPORT): void {
+    const bus = this.bus("reload", "mechanism");
+    const t = duration;
+    const p = voice.actionPitch;
+    const g = voice.actionVol;
+    this.clack(bus, 2600 * p, 0.9 * g, 0);
+    if (!this.mechanism(bus, "magOut", MAG_OUT_PEAK, t * 0.18, p, g)) {
+      this.clack(bus, 1500 * p, 0.5 * g, t * 0.18);
+    }
+    if (!this.mechanism(bus, "magIn", MAG_IN_PEAK, t * 0.55, p, g)) {
+      this.clack(bus, 760 * p, 1 * g, t * 0.55);
+    }
+    this.clack(bus, 3400 * p, 0.8 * g, t * 0.8);
+  }
+
+  /**
+   * A recorded piece of the weapon's mechanism, landed on a beat by its own
+   * transient — `clack`'s counterpart, and `sample`'s wrapper for the one
+   * caller that has to schedule backwards.
+   *
+   * `peak` is where the transient sits inside the file; `at` is when the
+   * player should HEAR it, which is the frame `ViewModel` draws that event on.
+   * `playbackRate` scales the file's whole timeline, so the approach in front
+   * of the transient lasts `peak / pitch` rather than `peak` — the LMG's 0.68
+   * stretches it half as long again, which is a slower hand and is the point.
+   *
+   * The clamp is not defensive about the numbers as they stand, which fit
+   * every weapon in the kit with room to spare (the tightest is the sidearm's
+   * seat at 578 ms against 150 ms of approach). It is defensive about
+   * `reloadTime`, which lives in a weapon's row and is exactly the kind of
+   * number that gets halved — and a delay that went negative would put the
+   * slap AFTER the beat rather than before it, which reads as a fault.
+   *
+   * Returns `sample`'s own answer, which is "there is a recording" and not
+   * "it played" — see that method for why a refusal at the voice cap must not
+   * fall through to the synthesis.
+   */
+  private mechanism(
+    bus: MixBus | null,
+    id: SampleId,
+    peak: number,
+    at: number,
+    pitch: number,
+    vol: number,
+  ): boolean {
+    return this.sample(bus, id, {
+      vol: MECHANISM_LEVEL * vol,
+      rate: pitch,
+      delay: Math.max(0, at - peak / pitch),
+      // The same send `clack` gives the beats this stands among. Both
+      // mechanism masters are DRY — `reload.wav` gated to digital silence
+      // between its gestures and `bolt-cycle.wav` decaying 55 to 63 dB
+      // monotonically with no plateau over a -72 dB preamp floor — so what is
+      // in the file is the direct sound and the room is the game's, which is
+      // the rule the eight reports are cut to and the one these arrived
+      // already obeying.
+      send: 0.2,
+    });
+  }
+
+  /**
+   * Working the bolt: lugs turning free, the bolt drawn back onto its stop, a
+   * case out, the bolt driven home on a round, and the handle down.
+   *
+   * `reload`'s sibling and `rpgLoad`'s, and it takes its rule from both: the
+   * offsets are FRACTIONS of the duration it is handed, so the sounds land on
+   * `CONFIG.viewmodel.cycle`'s beats to the frame whatever the weapon's rate
+   * is, and the weapon's own mechanism voices it through `actionPitch` /
+   * `actionVol`. Change a fraction here and change it there — the whole of what
+   * makes a gesture legible is that what you SEE lands on what you HEAR.
+   *
+   * **It is the only sound in the game that is a wait rather than an event.**
+   * Every other mechanism sound here is a thing arriving — a catch, a seat, a
+   * hammer — because every other gesture is over before the player has
+   * finished reacting to what caused it. A bolt cycle is a second and a
+   * quarter the player spends unable to shoot, and what has to be audible is
+   * how long that is: four unrelated clicks with silence between them sound
+   * like a fault rather than like a rifle being worked.
+   *
+   * **All four beats are RECORDED, and this is the first gesture in the game
+   * where a sample replaces the TRAVEL as well as the arrival.**
+   * `audio/src/bolt-cycle.wav` is one performance of exactly this gesture, cut
+   * into the four moments `CONFIG.viewmodel.cycle` draws — one row per beat,
+   * for the reason `magOut` leaves the catch behind and the carbine's report
+   * leaves two rounds behind: what a sample may contain is one beat's worth of
+   * sound, or it agrees with the picture at exactly one rate. Between them the
+   * four cover 40–1034 ms of the sniper's 1250 with a single 22 ms gap in the
+   * middle, and that gap is the bolt sitting at the rear stop, which is the
+   * one moment in a cycle that is silent.
+   *
+   * So the two synthesized SLIDES retire into the samples rather than playing
+   * under them. Each is inside its own arm here, not on a line of its own:
+   * `boltBack` carries 115 ms of the bolt travelling ahead of the stop and
+   * `boltHome` 133 ms of it running forward over the magazine, and a recorded
+   * mechanism played over a synthesized one is the SMG's mistake — that
+   * weapon's master was cut short of its own bolt precisely because
+   * `actionVol` was already voicing one. `boltBack` also takes the CASE with
+   * it: the two are 62 ms apart here because a filtered noise burst cannot be
+   * steel and brass at once, and on the tape they are the same millisecond
+   * (46% of that peak's energy sits above 8 kHz, against 18% at the bolt going
+   * home).
+   *
+   * **What is left when `audio/` is deleted is exactly the sound this method
+   * has always made**, beat by beat and arm by arm, which is the bargain every
+   * row in `samples.ts` makes. In that synthesis the two slides sweep in
+   * OPPOSITE directions and that pairing is the whole read: drawing back opens
+   * out — a case coming free and the action opening to the air — and closing
+   * sweeps down and shuts, because it ends against a locked breech. The
+   * recording says the same thing without being asked to, brightening to a
+   * 7.5 kHz centroid at the stop and arriving at 5.1 kHz on the breech.
+   */
+  boltCycle(duration: number, voice: ReportVoice = FLAT_REPORT): void {
+    const bus = this.bus("boltCycle", "mechanism");
+    const t = duration;
+    const p = voice.actionPitch;
+    const g = voice.actionVol;
+    // The lugs turning out of their seats: high, short and dry. It is the
+    // lightest event of the five and the first, which is what makes the rest
+    // read as consequences of it.
+    if (!this.mechanism(bus, "boltLift", BOLT_LIFT_PEAK, t * 0.16, p, g)) {
+      this.clack(bus, 3100 * p, 0.55 * g, t * 0.16);
+    }
+    if (!this.mechanism(bus, "boltBack", BOLT_BACK_PEAK, t * 0.42, p, g)) {
+      // Drawn back — the slide, opening upward — onto the rear stop, which is
+      // the hardest single event in the cycle because it is a mass stopped by
+      // a shoulder of steel rather than seated on one.
+      this.burst(bus, {
+        dur: 0.16 / p, vol: 0.1 * g, type: "bandpass", freq: 700 * p,
+        freqEnd: 1900 * p, q: 1.1, delay: t * 0.2, send: 0.22,
+      });
+      this.clack(bus, 1250 * p, 1 * g, t * 0.42);
+      // The case out: bright, small and OFF to the side of everything else in
+      // the mix, which is what a piece of brass leaving a rifle sounds like
+      // against the mechanism that put it there.
+      this.clack(bus, 4200 * p, 0.4 * g, t * 0.47);
+    }
+    if (!this.mechanism(bus, "boltHome", BOLT_HOME_PEAK, t * 0.68, p, g)) {
+      // Driven home — the slide, closing downward — and the heaviest clack of
+      // the five, because this is the one with a round on the end of it.
+      this.burst(bus, {
+        dur: 0.15 / p, vol: 0.11 * g, type: "lowpass", freq: 1700 * p,
+        freqEnd: 420 * p, delay: t * 0.48, send: 0.26,
+      });
+      this.clack(bus, 620 * p, 1.1 * g, t * 0.68);
+      this.tone(bus, 190 * p, 0.08, "sine", 0.05, 0.6, null, { delay: t * 0.68 });
+    }
+    // The handle down into its notch — the sound that says the weapon is live
+    // again, and the one the player is actually waiting on. Last, and pitched
+    // clear of the seat above it so the two do not read as one event.
+    if (!this.mechanism(bus, "boltLock", BOLT_LOCK_PEAK, t * 0.78, p, g)) {
+      this.clack(bus, 2300 * p, 0.8 * g, t * 0.78);
+    }
+  }
+
+  /**
+   * Swapping weapons: one goes onto the sling, the other comes off it.
+   *
+   * Two events rather than a rummage, and they are placed where the hands
+   * actually are — the first on the button, the second at the point the
+   * viewmodel exchanges the models — so the sound tells you how far through
+   * the wait you are, which on a swap is the only thing you want to know. The
+   * second is the brighter of the two: a weapon coming up is what the player
+   * is waiting for, and the sound that says "you can shoot" should be the one
+   * that carries.
+   */
+  swap(duration: number): void {
+    const bus = this.bus("swap", "mechanism");
+    this.clack(bus, 900, 0.55, 0);
+    this.clack(bus, 2200, 0.7, duration * 0.45);
+  }
+
+  /**
+   * A grenade leaving the hand: the pin and lever going, then the cloth of the
+   * throw. Player-local — bots' throws are deliberately silent, because the
+   * one cue that matters for an incoming grenade is the blinking pip on the
+   * thing itself, and sixteen bots' worth of throw noise would bury it.
+   */
+  grenadeThrow(): void {
+    const bus = this.bus("grenadeThrow", "mechanism");
+    this.clack(bus, 3200, 0.55, 0);
+    this.burst(bus, {
+      dur: 0.13, vol: 0.1, type: "bandpass", freq: 800, freqEnd: 1900,
+      q: 0.9, delay: 0.06, send: 0.15,
+    });
+  }
+
+
+  /**
+   * A rocket leaving a launcher: the motor lighting, the tube's own crack, and
+   * the whoosh trailing away behind it.
+   *
+   * `cannon` reasoned about from the other end. A tank gun is a slam with a
+   * long roll under it because a shell is pushed by a charge that is over
+   * before the round leaves; a launcher is the opposite shape — a soft leading
+   * edge, then a hiss that keeps going, because the motor is still burning
+   * after the thing has gone. What the two share is the low body, which is why
+   * this is here beside it rather than shaped out of `CONFIG.weapons`'
+   * `ReportVoice`: an eight-scalar deviation from a rifle cannot describe a
+   * sound whose loudest part arrives after the shot.
+   *
+   * Spatialised like every other weapon, and audible as far as a cannon is:
+   * the point of a launcher on the map is that the crew knows there is one.
+   *
+   * **A recording (`rocketLauncher`) stands in for all four layers when it has
+   * landed**, on `shoot`'s terms: a preference, never a requirement, and the
+   * synthesis below is what the game does without it. The file is cut at the
+   * moment the launch stops and the room takes over, which is what leaves the
+   * MOTOR in it — the layer the fourth burst below exists for — and leaves the
+   * tail to the shared convolver.
+   */
+  launcher(at: Vector3): void {
+    const bus = this.bus("launcher", "explosion");
+    const a = CONFIG.audio;
+    const dist = this.distanceToListener(at);
+    if (dist > a.maxDistance * 2.2) return;
+    const panner = this.panner(bus, at);
+    if (!panner) return;
+    const far = Math.min(1, dist / (a.maxDistance * 1.4));
+    const delay = dist / a.speedOfSound;
+    const v = 0.94 + Math.random() * 0.12;
+    // A recording stands in for all four layers, and like `tankCannon` it is a
+    // deviation from nothing: there is no row in `CONFIG.weapons` behind an AT
+    // launcher, so there is no `pitch` and no `level` to spend on it. `v`
+    // alone, plus the air absorption the four layers below carry in their own
+    // filter frequencies — the panner is already the level and `delay` already
+    // the propagation, so that is the only distance cue left to put back.
+    if (this.sample(bus, "rocketLauncher", {
+      vol: LAUNCH_LEVEL, rate: v, delay, out: panner,
+      // The same fraction of its own layers' sends that `explosion` and
+      // `cannon` each take of theirs: the four below sum to 3.2 across layers
+      // a filter has already emptied, and this is the file at full scale.
+      send: 1.3, lowpass: 14000 - 12800 * far,
+    })) return;
+    // The ignition: broadband, and softer at the front than a gun's, because
+    // nothing here is a sealed breech letting go.
+    this.burst(bus, {
+      dur: 0.09, vol: 0.7 * (1 - far * 0.6), type: "highpass",
+      freq: (900 - 600 * far) * v, q: 0.5, delay, out: panner, send: 0.6,
+    });
+    // The body: the backblast off the venturi, sweeping down as it spreads.
+    this.burst(bus, {
+      dur: 0.5 + far * 0.3, vol: 0.9, type: "lowpass",
+      freq: 620 - 400 * far, freqEnd: 70, delay, out: panner, send: 1.4,
+    });
+    // The chest of it. Higher and shorter than a cannon's — a shoulder tube,
+    // not a hundred and twenty millimetres.
+    this.tone(bus, 38 * v, 0.36, "sine", 0.4 * (1 - far * 0.45), 0.55, panner, {
+      delay, send: 0.7,
+    });
+    // The motor going away, which is the layer that says ROCKET. It starts
+    // under the launch and outlives it, and it climbs rather than falling:
+    // everything else here is a pressure wave spreading, and this is a thing
+    // receding, so it is the one layer whose filter sweeps UP.
+    this.burst(bus, {
+      dur: 0.62, vol: 0.3 * (1 - far * 0.5), type: "bandpass",
+      freq: 700 * v, freqEnd: 2600, q: 0.8, delay: delay + 0.05, out: panner,
+      send: 0.5,
+    });
+  }
+
+  /**
+   * Loading a launcher: the next rocket coming out of the bag, tapped onto the
+   * mouth of the tube, driven home, and the hammer thumbed back.
+   *
+   * `reload` reasoned about from the other end, and the differences are all the
+   * same difference — this is a MUZZLE load. There is no catch and no magazine
+   * falling free, because nothing was released; the first thing you hear is
+   * webbing, because the round has to be fetched. The last thing is the hammer
+   * rather than a bolt, and it is the one that matters: an RPG is cocked by
+   * hand, so the cock IS the sound that says the weapon will fire.
+   *
+   * Player-local and unspatialised like the grenade's throw and the mine's
+   * plate: it is a thing happening in your own hands. What somebody else's
+   * launcher is heard as is `launcher`, and nothing between.
+   *
+   * **The four offsets are `CONFIG.viewmodel.load`'s beats and must move with
+   * them** — the same contract `reload` has with `viewmodel.reload`, and for
+   * the same reason: the whole of what makes a gesture legible is that what
+   * you SEE lands on what you HEAR. Change a fraction in either file and
+   * change it in both.
+   */
+  rpgLoad(duration: number): void {
+    const bus = this.bus("rpgLoad", "mechanism");
+    const t = duration;
+    // The round out of the bag: cloth and webbing, which is the one soft
+    // event in a family of metallic ones and is what says a thing was
+    // FETCHED rather than worked.
+    this.burst(bus, {
+      dur: 0.22, vol: 0.09, type: "bandpass", freq: 520, freqEnd: 1400,
+      q: 0.8, delay: t * 0.26, send: 0.2,
+    });
+    // The boom tapped onto the muzzle as the round is offered to the bore.
+    // Light and high: it is a rim being found, not a part going home.
+    this.clack(bus, 2900, 0.45, t * 0.56);
+    // The motor driven down the tube — the long one, and the only sound here
+    // with any length to it, because it is the only event that is a SLIDE.
+    this.burst(bus, {
+      dur: 0.17, vol: 0.14, type: "lowpass", freq: 1500, freqEnd: 380,
+      delay: t * 0.6, send: 0.3,
+    });
+    // Home. The heaviest of the four: a kilogram of rocket against a stop.
+    this.clack(bus, 620, 1, t * 0.78);
+    this.tone(bus, 210, 0.09, "sine", 0.05, 0.5, null, { delay: t * 0.78 });
+    // The hammer back. Bright, short, and last — the launcher's bolt.
+    this.clack(bus, 3300, 0.7, t * 0.9);
+  }
+
+  /**
+   * A mine going down on the road: the plate settling, then the fuze arming a
+   * beat later.
+   *
+   * Two events rather than one, because the mine IS two events — a thing put
+   * down and a thing switched on — and the gap between them is
+   * `CONFIG.equipment.mine.mine.armTime`, which is the one number about this
+   * weapon a player has to feel. The arming beep is the audible half of the
+   * lamp coming on, so both halves of the tell say the same thing at the same
+   * moment.
+   *
+   * Player-local and unspatialised, like the grenade's throw: it is a thing
+   * happening in your own hands. What somebody ELSE's mine is heard as is the
+   * blast, and nothing before it.
+   */
+  mineSet(): void {
+    const bus = this.bus("mineSet", "mechanism");
+    // Metal on stone, twice: the plate down, then the rim rocking flat.
+    this.clack(bus, 420, 0.9, 0);
+    this.clack(bus, 300, 0.5, 0.07);
+    this.burst(bus, {
+      dur: 0.16, vol: 0.09, type: "lowpass", freq: 260, freqEnd: 90,
+      delay: 0.01, send: 0.25,
+    });
+    // The fuze, on the arming clock. A single clean tone against a mix that
+    // has nothing else like it in it.
+    this.tone(bus, 1650, 0.07, "square", 0.05, 1, null, {
+      delay: CONFIG.equipment.mine.mine.armTime,
+    });
+  }
+
+  pickup(): void {
+    const bus = this.bus("pickup", "feedback");
+    this.tone(bus, 700, 0.08, "sine", 0.07, 1.6);
+  }
+
+  jump(): void {
+    const bus = this.bus("jump", "footstep");
+    this.tone(bus, 330, 0.08, "sine", 0.04, 1.6);
+  }
+
+  /**
+   * One boot going down, at the player's own feet. `weight` is 0..1 — a
+   * crouched shuffle to a sprint.
+   *
+   * Two layers, and the split is the whole sound: a soft lowpassed thud is the
+   * boot's mass arriving, and a very short bandpassed scuff on top is the grit
+   * it lands on. The thud alone is a knock on a door; the scuff alone is a
+   * brush stroke. Both are slices of the shared noise buffer for the same
+   * reason gunfire is — a footstep has no pitch, and anything with one reads
+   * as a click track under the movement.
+   *
+   * Volumes here are deliberately an order below the rifle. This plays two to
+   * three times a second for the entire round, which is exactly the sound that
+   * gets mixed too loud and then cannot be un-noticed.
+   */
+  step(weight: number): void {
+    const bus = this.bus("step", "footstep");
+    const v = 0.88 + Math.random() * 0.24;
+    // A lowpass throws most of a noise slice's amplitude away, so the gain is
+    // set well above the level this plays at — same as the report's body.
+    this.burst(bus, {
+      dur: 0.07, vol: 0.3 * weight, type: "lowpass", freq: 420 * v,
+      freqEnd: 130, send: 0.12,
+    });
+    this.burst(bus, {
+      dur: 0.035, vol: 0.05 * weight * v, type: "bandpass", freq: 2400 * v,
+      q: 0.8, send: 0.1,
+    });
+  }
+
+  /**
+   * Touching down. `weight` is 0..1 across the fall speeds `CONFIG.audio
+   * .footstep` calls a landing rather than a step; the loud end is both boots
+   * and the gear on them, so it gets a third layer the walking step does not.
+   */
+  land(weight: number): void {
+    const bus = this.bus("land", "footstep");
+    const v = 0.9 + Math.random() * 0.2;
+    this.burst(bus, {
+      dur: 0.09 + weight * 0.06, vol: 0.34 + 0.3 * weight, type: "lowpass",
+      freq: 300 * v, freqEnd: 90, send: 0.2,
+    });
+    this.burst(bus, {
+      dur: 0.05, vol: 0.07 + 0.07 * weight, type: "bandpass", freq: 1900 * v,
+      q: 0.7, send: 0.15,
+    });
+    // Webbing and magazines catching up with the body, a beat behind the feet.
+    if (weight > 0.25) {
+      this.clack(bus, 3000, 0.35 * weight, 0.035);
+    }
+  }
+
+  /** Flag captured. */
+  capture(): void {
+    const bus = this.bus("capture", "objective");
+    this.tone(bus, 440, 0.12, "sine", 0.07, 1.5);
+    setTimeout(() => this.tone(bus, 660, 0.18, "sine", 0.07, 1.2), 130);
+  }
+
+  /** Flag lost or neutralised — the same shape, falling instead of rising. */
+  flagLost(): void {
+    const bus = this.bus("flagLost", "objective");
+    this.tone(bus, 520, 0.14, "sine", 0.06, 0.65);
+    setTimeout(() => this.tone(bus, 340, 0.2, "sine", 0.06, 0.7), 130);
+  }
+
+  // --- world-space ---
+
+  /**
+   * A round arriving somewhere. Spatialised through exactly the machinery bot
+   * fire uses — panner, propagation delay, air absorption in the filter
+   * frequency, and a reverb send that climbs with distance — because the
+   * world may only describe distance one way, and a wall being hit is as much
+   * a fact about the village as the rifle that hit it.
+   *
+   * **ONE layer, three gates, and all four of those are the voice cap.** This
+   * is the only sound in the game generated at gunfire's rate while mattering
+   * less than gunfire: sixteen bots is ~80 rounds a second and nearly every
+   * one lands. So it is rejected past `impactRange`, rate-limited to ~22 a
+   * second, and refused against a RESERVE rather than against `maxVoices` —
+   * see `CONFIG.audio` for why the reserve is the load-bearing one.
+   *
+   * The kinds differ only in filter, length and level, which is all the
+   * ear needs: a tick off stone, a duller thud into earth, and a wet slap
+   * into a body. All noise and no oscillator, per this class's own rule —
+   * an impact is the most obviously *struck* thing in the game.
+   *
+   * **Glass is the exception to the gates as well as to the filter**, because
+   * it is not an impact at the same rate as the others: a round that crosses a
+   * pane breaks it once and every round after it crosses a hole. So it skips
+   * the rate limiter — a pane can only break once, so there is no stream of
+   * them to limit — and carries further, because a window going in is a thing
+   * the whole street hears and is worth hearing at a range a spark off a wall
+   * is not.
+   */
+  impact(at: Vector3, kind: "flesh" | "ground" | "hard" | "glass"): void {
+    const bus = this.bus(IMPACT_CHANNEL[kind], "impact");
+    const a = CONFIG.audio;
+    if (!this.ctx) return;
+    // Against the reserve, and BEFORE any work: the point is to leave voices
+    // standing for the gunshots, not to discover there are none left.
+    if (this.voices >= a.maxVoices - a.impactReserve) return;
+    const now = this.ctx.currentTime;
+    const glass = kind === "glass";
+    if (!glass && now - this.lastImpact < a.impactInterval) return;
+    const range = glass ? a.glassRange : a.impactRange;
+    const dist = this.distanceToListener(at);
+    if (dist > range) return;
+    const panner = this.panner(bus, at);
+    if (!panner) return;
+    // A break does not spend the rate limiter either, or one window going in
+    // would silence the next four rounds' worth of sparks around it.
+    if (!glass) this.lastImpact = now;
+    const far = dist / range;
+    // The delay is honest for every round but your own, and that is the case
+    // to keep it for. A bot shooting a wall thirty metres away owes you
+    // `dist/343`; your own round owes you that too, on top of a tracer already
+    // flying at 320 m/s against a real 900 — so your long shots crack a
+    // fraction late. Dropping the term to fix that would break every other
+    // shot in the game, and a late crack reads as distance rather than as a
+    // fault.
+    const delay = dist / a.speedOfSound;
+    const send = a.reverbMix * (0.4 + far * a.reverbDistanceSend);
+    const v = 0.88 + Math.random() * 0.24;
+    const near = 1 - far * 0.5;
+    if (glass) {
+      // Two layers, and the pair is what makes it read as a sheet failing
+      // rather than a bottle dropping: a bright crack as the pane goes, and a
+      // longer, quieter tail of pieces landing under it. Both are noise, and
+      // the tail's own delay is on top of the flight time so the fall is heard
+      // after the break rather than with it.
+      this.burst(bus, {
+        dur: 0.06, vol: 0.4 * near, type: "highpass",
+        freq: 3400 * v, freqEnd: 5200, q: 0.7,
+        delay, out: panner, send,
+      });
+      this.burst(bus, {
+        dur: 0.34, vol: 0.2 * near, type: "bandpass",
+        freq: 5200 * v, freqEnd: 2400, q: 2.4,
+        delay: delay + 0.05, out: panner, send,
+      });
+    } else if (kind === "hard") {
+      this.burst(bus, {
+        dur: 0.05, vol: 0.34 * near, type: "bandpass",
+        freq: 2600 * v * (1 - far * 0.4), freqEnd: 900, q: 1.1,
+        delay, out: panner, send,
+      });
+    } else if (kind === "ground") {
+      this.burst(bus, {
+        dur: 0.09, vol: 0.3 * near, type: "lowpass",
+        freq: 700 * v * (1 - far * 0.4), freqEnd: 160,
+        delay, out: panner, send,
+      });
+    } else {
+      this.burst(bus, {
+        dur: 0.07, vol: 0.26 * near, type: "lowpass",
+        freq: 420 * v, freqEnd: 120, q: 0.8,
+        delay, out: panner, send,
+      });
+    }
+  }
+
+  /**
+   * Somebody else's weapon, somewhere out in the village. Three layers,
+   * spatialised, and the first thing dropped when the voice budget runs out.
+   *
+   * **Distance is heard three ways here, and only one of them is volume.** The
+   * panner handles the level; on top of that the report arrives late (sound
+   * covers the map in a fifth of a second, and a flash you see before you hear
+   * it is the strongest range cue there is), air absorption strips the top off
+   * the crack long before the shot gets quiet, and the reverb send climbs, so
+   * a shot across the valley is nearly all tail. The result is that a rifle at
+   * 15 m and one at 60 m are different *sounds*, not the same sound twice.
+   *
+   * **The third layer is the low roll, and it is gated on distance rather than
+   * faded out over the full range** (`CONFIG.audio.thumpRange`). It is what
+   * makes a weapon going off across the street a physical event rather than a
+   * noise, and it is also the layer the map cannot afford at scale: this is
+   * the sound sixteen bots generate eighty a second, and the ones out at
+   * sixty metres would be spending a voice on a rumble the panner has already
+   * taken to nothing. So the near half of the field gets weight and the far
+   * half gets range cues, which is what each one is actually listening for.
+   *
+   * `voice` is the shooter's weapon, and it is the whole reason a match can be
+   * read by ear: sixteen bots fire one flat round off the same rig and are
+   * heard as the rifle they are holding, while a person's slot carries their
+   * own weapon from the authority (`ServerEvent.fire`'s `w`). A DMR two
+   * streets away does not sound like the SMG beside you.
+   *
+   * `after` is extra seconds on the audio clock, on top of the propagation
+   * delay, and it exists for one caller: a netplay round is told what a remote
+   * weapon did once per snapshot, so two rounds fired inside the same 50 ms
+   * arrive as one message and have to be laid back out in time. Scheduled on
+   * the audio clock rather than through a `setTimeout`, so the spacing is
+   * sample-accurate and unaffected by the frame rate.
+   */
+  botShot(at: Vector3, after = 0, voice: ReportVoice = FLAT_REPORT): void {
+    const bus = this.bus(voice.mix ?? "otherGun", "worldGun");
+    const a = CONFIG.audio;
+    const dist = this.distanceToListener(at);
+    // The gate, and it is a VOICE decision rather than a free one: under the
+    // inverse rolloff 70 m is ~24 dB down through an air-absorption lowpass
+    // that has taken the top off it, which is a shot nothing in a firefight
+    // could pick out — so building the nodes only burns voices that could
+    // have carried an audible one. Reject before the panner, not after.
+    if (dist > a.maxDistance) return;
+    const panner = this.panner(bus, at);
+    if (!panner) return;
+    const far = dist / a.maxDistance;
+    const delay = after + dist / a.speedOfSound;
+    const send = a.reverbMix * (0.4 + far * a.reverbDistanceSend);
+    const v = 0.9 + Math.random() * 0.2;
+    const p = voice.pitch;
+    // A recording replaces all three layers, and the two distance cues the
+    // synthesis carries in its own filters have to be put back around it by
+    // hand or a rifle at sixty metres is the rifle beside you turned down.
+    // The propagation delay and the climbing send are already `delay` and
+    // `send`; what is missing is AIR ABSORPTION, which is why there is a
+    // lowpass here and none in `shoot` — it sweeps from effectively open in
+    // your ear down to a thud at the edge of the map. The low roll's own
+    // `thumpRange` gate is not reproduced: the file already has whatever
+    // bottom end it was cut with, and the panner is what takes it away.
+    //
+    // **This is the one place a sample costs more than the synthesis and it
+    // is not obvious from the level.** A voice is counted for as long as it
+    // is SCHEDULED, and a file is held for the whole of it — 96 to 180 ms
+    // across the kit — where the three layers it replaces run 0.03, ~0.1 and
+    // 0.2 scaled by `length` and release in that order. So the same firefight
+    // holds more voices open here, and the cap is what absorbs it, by dropping
+    // shots. Nothing is wrong when that happens (the impact reserve is
+    // untouched, and a dropped bot shot at range is the sound the cap exists
+    // to spend), but a recording is not free at sixteen shooters the way it
+    // is at one, and the lever if it ever needs one is a SHORTER file — a
+    // `trim.end` in `audio/manifest.json` — rather than a quieter graph.
+    // `rate` is `v` and not `v * p`, for the reason `shoot` argues at length:
+    // a recording of this weapon has already said what `pitch` says. `p` below
+    // is the synthesis's, and every use of it there is a filter frequency.
+    if (voice.sample && this.sample(bus, voice.sample, {
+      vol: SAMPLE_LEVEL * 0.8 * voice.level, rate: v, delay, out: panner,
+      send: send * voice.tail, lowpass: 16000 - 14800 * far,
+    })) return;
+    this.burst(bus, {
+      dur: 0.03, vol: 0.4 * v * voice.level * voice.snap * (1 - far * 0.8),
+      type: "highpass", freq: (2400 - 1700 * far) * v * p, q: 0.6, delay,
+      out: panner, send: send * 0.3 * voice.tail,
+    });
+    // The far half of the map hears a longer, duller thud; the near half hears
+    // a report with an edge on it.
+    this.burst(bus, {
+      dur: (0.1 + far * 0.14) * voice.length, vol: 0.62 * voice.level,
+      type: "lowpass", freq: (1500 - 1150 * far) * p, freqEnd: 190 * p, delay,
+      out: panner, send: send * voice.tail,
+    });
+    // The low roll, close in only. Faded over its OWN range rather than the
+    // panner's much longer one, so the last of it trails off instead of
+    // stopping at a line — the same rule `botStep` follows for the same
+    // reason.
+    if (dist >= a.thumpRange) return;
+    const near = 1 - dist / a.thumpRange;
+    this.burst(bus, {
+      dur: 0.2 * voice.length, vol: 1.5 * near * voice.level * voice.weight,
+      type: "lowpass", freq: 320 * p, freqEnd: 95 * p, q: 3, delay,
+      out: panner, send: send * 0.8 * voice.tail,
+    });
+  }
+
+  /**
+   * A grenade going off. Spatialised like bot fire, and built the same way —
+   * filtered slices of the shared noise buffer plus one pitched layer for the
+   * part that genuinely is a single frequency.
+   *
+   * The difference from a gunshot is entirely in the time scale, and that is
+   * what makes it read as an explosion rather than as a loud rifle: the crack
+   * is the same order (a few tens of milliseconds), but underneath it sits a
+   * half-second low roll and a full second of debris, and the reverb send is
+   * near unity because outdoors a blast is mostly the valley answering it.
+   *
+   * Exempt from `botShot`'s early distance rejection at `maxDistance`: a
+   * grenade at 90 m is still a thing you want to know happened, and there are
+   * seconds between them rather than eighty a second, so it can afford the
+   * voices.
+   *
+   * **`power` is the same grenade-relative size the picture is drawn at** (see
+   * `GrenadeSystem`), and a bigger blast is voiced by going DOWN rather than by
+   * going up: every pitched layer divides by it and the roll runs longer, while
+   * the levels barely move. That is what a bigger charge actually sounds like,
+   * and it is also the only version that stays inside the mix — a shell voiced
+   * as a grenade at twice the gain is a clip, not a bang.
+   *
+   * **A recording (`explosion`) stands in for all four layers when it has
+   * landed, and that one file is every explosion in the game** — the argument
+   * is on the arm below, and the shape is `shoot`'s: it is a PREFERENCE, so a
+   * blast before the decode arrives, or on a device that failed the fetch, is
+   * these four layers and nothing tells the caller which it got. The DEBRIS
+   * layer goes with them, which is the one thing this replacement takes that
+   * the report's does not — the file's own last 300 ms is what stands in for
+   * it, and `BlastDebrisSystem` still draws the rubble either way.
+   */
+  explosion(at: Vector3, power = 1): void {
+    const bus = this.bus("blast", "explosion");
+    const a = CONFIG.audio;
+    const dist = this.distanceToListener(at);
+    // A bigger blast carries further, on the same 1.6x exemption.
+    if (dist > a.maxDistance * 1.6 * power) return;
+    const panner = this.panner(bus, at);
+    if (!panner) return;
+    const far = Math.min(1, dist / (a.maxDistance * power));
+    const delay = dist / a.speedOfSound;
+    const v = 0.92 + Math.random() * 0.16;
+    // A blast twice the size is not twice as loud; it is lower and longer. The
+    // pitch divisor is square-rooted so 1.85x power is a fifth down rather than
+    // an octave, which is where a tank gun sits against a frag.
+    const drop = Math.sqrt(power);
+    const gain = Math.min(1.35, 0.75 + 0.25 * power);
+    // A recording stands in for all four layers, and it is ONE recording for
+    // every blast in the game: there is one blast here (`blastAt`) and `power`
+    // is how much of it this one is, so a grenade's own report is the
+    // reference exactly as the rifle's is for a weapon.
+    //
+    // **`power` is therefore spent ON the file, which is the exact inverse of
+    // the rule `shoot` follows and is `magOut`'s inversion rather than a new
+    // one**: a per-weapon report has already made its deviation, and a shared
+    // recording has said nothing at all about which blast it is going into.
+    // It is spent as `rate` — playbackRate, so pitch and length together —
+    // divided by the same `drop` the synthesis divides its pitched layers by,
+    // which makes a shell a fifth lower and 36% longer than the grenade on the
+    // tape. That is what this file is asked for and no more: the levels barely
+    // move, because a blast twice the size is not twice as loud.
+    //
+    // The two distance cues the four layers carry in their own filters have to
+    // be put back around it by hand, as `botShot` puts them around a report.
+    // The panner is already the level and `delay` already the propagation, so
+    // what is missing is AIR ABSORPTION — and only that: the layer durations
+    // that grow with `far` are not reproduced, because stretching a recording
+    // is `rate`, and `rate` is already carrying `power`.
+    if (this.sample(bus, "explosion", {
+      vol: BLAST_LEVEL * gain, rate: v / drop, delay, out: panner,
+      // A plain send, for `shoot`'s reason: the four levels below sum to ~3.2
+      // of these across layers a filter has already emptied, and this is the
+      // file at full scale. Wetter than a gunshot's, because outdoors a blast
+      // is mostly the valley answering it.
+      send: 1.3, lowpass: 14000 - 12800 * far,
+    })) return;
+    // The crack. Broadband, over in 40 ms, and the thing that says "sharp".
+    this.burst(bus, {
+      dur: 0.04 * drop, vol: 0.7 * v * gain * (1 - far * 0.7), type: "highpass",
+      freq: ((1800 - 1300 * far) * v) / drop, q: 0.5, delay, out: panner, send: 0.4,
+    });
+    // The body: a long lowpassed roll sweeping down as the pressure wave
+    // spreads. This is most of what a distant blast is.
+    this.burst(bus, {
+      dur: (0.5 + far * 0.35) * power, vol: gain, type: "lowpass",
+      freq: (900 - 600 * far) / drop, freqEnd: 70 / drop, delay, out: panner,
+      send: 1.4,
+    });
+    // The chest thump, a fifth of the rifle's pitch and five times its length.
+    this.tone(bus, (42 * v) / drop, 0.42 * power, "sine", 0.5 * gain * (1 - far * 0.5), 0.4, panner, {
+      delay, send: 0.8,
+    });
+    // Debris coming back down, well behind the blast — the tail that stops it
+    // sounding like a single event, and the one layer this game now DRAWS as
+    // well (see `BlastDebrisSystem`), so it runs as long as the rubble does.
+    this.burst(bus, {
+      dur: 0.7 * power, vol: 0.16 * gain * (1 - far * 0.6), type: "bandpass",
+      freq: 2200 * v, freqEnd: 700, q: 0.7, delay: delay + 0.14, out: panner,
+      send: 0.6,
+    });
+  }
+
+  /**
+   * A tank's main gun. The one report in the game that is not built from
+   * `CONFIG.weapons` — it is not a weapon in that table, it has no magazine
+   * and no `ReportVoice`, and shaping it as an eight-scalar deviation from a
+   * rifle would be describing a howitzer as a loud carbine.
+   *
+   * It is `explosion` reasoned about from the other end: the same four layers,
+   * because a gun that size and a blast that size are the same physics, with
+   * the crack pushed forward and much harder and the debris tail dropped. What
+   * is left is a slam with a long roll under it.
+   *
+   * Spatialised like every other gun, and audible half again as far as one:
+   * the whole point of a tank on the map is that everybody knows there is a
+   * tank on the map. **That is also why its recording is MONO** — there is no
+   * unpanned path to this sound even for the crew firing it, so it has no
+   * claim on the exception the carried weapons take, exactly as `mountedGun`
+   * has none.
+   *
+   * **A recording (`tankCannon`) stands in for all three layers when it has
+   * landed**, on `shoot`'s terms: a preference, never a requirement, and the
+   * synthesis below is what the game does without it.
+   */
+  cannon(at: Vector3): void {
+    const bus = this.bus("cannon", "worldGun");
+    const a = CONFIG.audio;
+    const dist = this.distanceToListener(at);
+    if (dist > a.maxDistance * 2.2) return;
+    const panner = this.panner(bus, at);
+    if (!panner) return;
+    const far = Math.min(1, dist / (a.maxDistance * 1.4));
+    const delay = dist / a.speedOfSound;
+    const v = 0.94 + Math.random() * 0.12;
+    // A recording stands in for all three layers, and this is the one sample
+    // in the game that is a deviation from nothing: there is no row in
+    // `CONFIG.weapons` behind this sound, so there is no `pitch`, no `level`
+    // and no `power` to spend on it. `v` alone, for the reason every other
+    // sampled gun takes it, plus the air absorption the three layers below
+    // carry in their own filter frequencies.
+    //
+    // **The file keeps its low ROLL where the LMG's was cut off**, which is
+    // that row read the other way round rather than an inconsistency: the LMG
+    // hands its roll to `report.weight` and `length` and must not be paid
+    // twice, and nothing here is going to play this one.
+    if (this.sample(bus, "tankCannon", {
+      vol: BLAST_LEVEL, rate: v, delay, out: panner,
+      send: 1.4, lowpass: 14000 - 12800 * far,
+    })) return;
+    // The muzzle blast: broadband and over in 60 ms. Twice a rifle's and half
+    // the length of the roll behind it.
+    this.burst(bus, {
+      dur: 0.06, vol: 1.15 * (1 - far * 0.6), type: "highpass",
+      freq: (1500 - 1100 * far) * v, q: 0.6, delay, out: panner, send: 0.7,
+    });
+    // The body, sweeping down as the pressure wave spreads. Longer than a
+    // grenade's, because the barrel keeps pointing it somewhere.
+    this.burst(bus, {
+      dur: 0.62 + far * 0.4, vol: 1, type: "lowpass",
+      freq: 700 - 460 * far, freqEnd: 55, delay, out: panner, send: 1.7,
+    });
+    // The chest thump, an octave under the grenade's.
+    this.tone(bus, 24 * v, 0.55, "sine", 0.62 * (1 - far * 0.45), 0.5, panner, {
+      delay, send: 0.9,
+    });
+  }
+
+  /**
+   * The engine of the tank the PLAYER is driving: one sustained voice, started
+   * on the way in and stopped on the way out.
+   *
+   * Deliberately NOT spatialised and deliberately NOT counted against the
+   * voice cap, and that — plus the CATCH below — is the whole of what makes
+   * this different from the identical graph every other hull gets through
+   * `hullEngine`. It is not a sound in the world you are listening to; it is
+   * the vehicle you are sitting in, the same reason the player's own report is
+   * exempt.
+   */
+  engineOn(kind: EngineKind): void {
+    const bus = this.bus(kind.mix, "engine");
+    if (this.engine) return;
+    const voice = this.buildEngine(bus, null, kind);
+    if (!voice) return;
+    this.engine = voice;
+
+    // The CATCH, and it belongs to THIS voice rather than to the graph. The
+    // build above comes up from silence over a couple of hundred
+    // milliseconds, which on its own is a fade and not a start: three
+    // one-shots make it the starter turning the engine over and the first
+    // cylinders finding compression. Ordinary one-shots, scheduled on the
+    // audio clock and voice-capped like any other — the sustained voice is
+    // the exception in this file, and this is not part of it.
+    //
+    // `hullEngine` fires none of them, because what starts a voice there is a
+    // tank arriving in earshot rather than a hand on a key — see that method.
+    //
+    // **A TURBINE does not catch, and giving it the same three one-shots was
+    // three cylinders finding compression in a machine that has none.** What
+    // starts one is a starter spinning air up through it before there is any
+    // fire at all, which is a single rising hiss and not an event — and unlike
+    // the diesel's catch it is not the start of the engine's own voice but the
+    // thing that happens BEFORE it, over the top of the long spool the rotor
+    // is already climbing through.
+    if (kind.rotor) {
+      this.burst(bus, {
+        dur: 1.1, vol: 0.1, type: "bandpass", freq: 200, freqEnd: 900, q: 2.2,
+      });
+      return;
+    }
+    this.burst(bus, { dur: 0.32, vol: 0.15, type: "bandpass", freq: 400, freqEnd: 250, q: 2.4 });
+    this.burst(bus, {
+      dur: 0.5, vol: 0.4, type: "lowpass", freq: 430, freqEnd: 70, q: 0.8,
+      delay: 0.24,
+    });
+    this.tone(bus, 58, 0.44, "sine", 0.36, 0.55, null, { delay: 0.26 });
+  }
+
+  /**
+   * The engine graph itself: six sources held open (seven off a rotor), and the
+   * ONE description in this game of what a powerplant sounds like. Both kinds
+   * of voice are this method — a null `panner` is the hull the player is
+   * sitting inside, wired straight onto the master bus, and a panner is
+   * anybody else's — and so are both kinds of MACHINE, which is the other
+   * nullable block: see `EngineKind.rotor`, read once at the top as `r`.
+   *
+   * **The five layers below are a diesel when `r` is null and a rotor when it
+   * is not, and they are the same five layers either way** — which is not a
+   * coincidence and is why this is one method rather than two. A cylinder
+   * firing and a blade passing are the same event: a lump, at a rate, with air
+   * moving round it. What differs is which rate, how deep the lump is, how far
+   * up the whistle sits, and — the only thing that is not a number — whether a
+   * governor is holding the rate still. The tail rotor is the one layer with
+   * no counterpart, and it is built only when there is one.
+   *
+   * **This is the only thing in this file that does not end on its own**, and
+   * the header's rule — nothing here schedules a repeating sound — is intact
+   * rather than bent: a repeating sound is a timer firing one-shots, and this
+   * is a graph of sources that is simply held open. The one thing in it that
+   * repeats is an OSCILLATOR (the firing rate below), which is the audio
+   * clock's business and not the frame's. It still stops with that clock, so a
+   * pause holds it exactly as it holds the tail of the last shot.
+   *
+   * It comes up SILENT and at cranking speed, so a caller owes it a
+   * `driveEngine` before there is anything to hear.
+   *
+   * **A diesel is a string of separate explosions, and that — not the spectrum
+   * of any one layer — is what this voice is built around.** Filtered noise and
+   * a sawtooth make a drone; the same two multiplied by a gain swinging at the
+   * FIRING RATE make an engine, because the ear reads the lump as combustion
+   * and everything without it as wind. Five layers hang off that idea:
+   *
+   * | layer | what it is for |
+   * | --- | --- |
+   * | chug — lowpassed noise, lumped | the mass of air a big diesel shifts |
+   * | growl — a sawtooth through an asymmetric clip, lumped | the iron in it |
+   * | chest — a sine well over it, lumped | the part you feel rather than hear |
+   * | turbo — two beating sines through a resonance | the only layer that says TURBO, and the only one that is late |
+   * | track — a resonant noise band, gated on speed | link on link, which a tank at speed has and an idling one does not |
+   *
+   * …and the same five read off a disc:
+   *
+   * | layer | what it is for |
+   * | --- | --- |
+   * | chug — the same lowpassed noise, lumped harder | the DOWNWASH, and the loudest thing a helicopter makes up close |
+   * | growl — nearly out of the mix | there is no combustion growl in a machine that burns continuously |
+   * | chest — half again, landing on the hull peak | the 95 Hz note that carries when everything over it is gone |
+   * | turbo — the same two sines, plus AIR through the same peak | the turbine, and the one layer that answers the spool alone |
+   * | track — silent, because `clatter` is 0 | nothing hung off a rotor runs on belts |
+   * | tail — a sawtooth read through a band well above itself | the tail rotor: the buzz under the thump |
+   *
+   * Everything but the turbo goes through the lump, and the turbo does not
+   * because a wheel spinning at forty thousand rpm does not care what the
+   * crank is doing — chopping it at the firing rate would make it a further
+   * cylinder rather than a compressor.
+   *
+   * The noise runs at a third speed so the shared one-second buffer loops every
+   * three, and it is lowpassed hard enough that the seam is not a thing an ear
+   * can find.
+   */
+  private buildEngine(
+    bus: MixBus | null,
+    panner: PannerNode | null,
+    kind: EngineKind,
+  ): EngineVoice | null {
+    const ctx = this.ctx;
+    if (!ctx || !bus || !this.noiseBuffer) return null;
+    // **The one question this method asks about a kind, asked once.** Every
+    // line below that reads it is a level or a corner frequency chosen for a
+    // disc instead of for a cylinder — see `EngineKind.rotor` — and a kind
+    // that states null gets the numbers this graph has always had, to the bit.
+    const r = kind.rotor;
+    try {
+      const out = ctx.createGain();
+      out.gain.value = 0;
+      // When there is a panner it is already on the bus — `hullEngine`
+      // builds it, because it is the node the range gate is about.
+      out.connect(panner ?? bus.dry);
+
+      // What comes off the bottom, and it is NOT a DC blocker — the shaper
+      // below is asymmetric and the lump multiplies signals by a gain they are
+      // phase-locked to, either of which could leave an offset behind, but
+      // with the curve normalised the way `growlShape` argues the measured DC
+      // is 0.0003 against a 0.36 peak and there is nothing there to remove.
+      // What this is for is the band UNDER the engine: the growl's own
+      // fundamental at idle is 26 Hz, which no speaker a player owns can make
+      // a sound in, and the soft clip on the master is charged for every bit
+      // of it.
+      const lowCut = ctx.createBiquadFilter();
+      lowCut.type = "highpass";
+      lowCut.frequency.value = 32;
+      lowCut.connect(out);
+
+      // The hull. One resonance the whole engine is heard through, because a
+      // diesel in a steel box is not a spectrum, it is a room. A peak here
+      // buys more weight than any amount of level on the layers does: it
+      // lifts one band rather than everything, so what comes up is the bottom
+      // and not the hiss with it.
+      const body = ctx.createBiquadFilter();
+      body.type = "peaking";
+      body.frequency.value = 92;
+      body.Q.value = 1.1;
+      body.gain.value = 4.5;
+      body.connect(lowCut);
+
+      // THE LUMP, and it is the whole voice. Every layer but the turbo is
+      // multiplied by this one gain, so the engine breathes at the firing rate
+      // instead of droning at it.
+      //
+      // Two details carry it. A SAWTOOTH rather than a sine, because the
+      // discontinuity once a cycle is the edge of a power stroke and a sine is
+      // a wobble. And the depth is NEGATIVE, which flips that saw over: a
+      // positive one swells slowly and then drops, which is a firing order
+      // running backwards. What is wanted is the bang first and the decay
+      // after it.
+      const lump = ctx.createGain();
+      lump.gain.value = 0.68;
+      lump.connect(body);
+      const fire = ctx.createOscillator();
+      fire.type = "sawtooth";
+      // Cranking speed. `engineDrive` pulls this up to idle over its own
+      // couple of hundred milliseconds, so the engine CATCHES rather than
+      // fading in at the note it will settle on.
+      fire.frequency.value = 6;
+      // The saw's own edge is one SAMPLE wide, and a gain that steps in one
+      // sample is a click by definition — thirteen to thirty-two of them a
+      // second, which is a buzz and not a diesel. Rounding it to a couple of
+      // milliseconds is what turns each firing into a thump: the attack is
+      // still far faster than anything else in the mix, which is what makes it
+      // read as an impact, and it is no longer a discontinuity. Measured as
+      // the worst sample-to-sample jump over a whole mount-to-dismount render:
+      // 0.130 without this filter against a 0.36 peak, and about 0.05 with it.
+      const fireEdge = ctx.createBiquadFilter();
+      fireEdge.type = "lowpass";
+      // A harder edge on a disc, and the argument above is unchanged in kind:
+      // 260 Hz still rounds the step to about half a millisecond, which is far
+      // slower than a sample and far faster than anything else in the mix. A
+      // blade slap is a CRACK where a cylinder firing is a thump, and rounding
+      // both to the same corner made the rotor a soft flutter.
+      fireEdge.frequency.value = r ? 260 : 190;
+      fireEdge.Q.value = 0.9;
+      const fireDepth = ctx.createGain();
+      // The resting depth. On a rotor `driveEngine` writes this every frame —
+      // the load IS the depth there — so what it is set to here is only where
+      // the chop starts.
+      fireDepth.gain.value = r ? -0.3 : -0.4;
+      fire.connect(fireEdge).connect(fireDepth).connect(lump.gain);
+
+      // The chug: the shared noise buffer at a third speed, lowpassed to a
+      // rumble. It is the meat of the thing, and it is noise rather than a
+      // tone because most of what a big diesel makes is air being moved.
+      const noise = ctx.createBufferSource();
+      noise.buffer = this.noiseBuffer;
+      noise.loop = true;
+      noise.playbackRate.value = 0.33;
+      const chugTone = ctx.createBiquadFilter();
+      chugTone.type = "lowpass";
+      chugTone.frequency.value = 420;
+      chugTone.Q.value = 0.8;
+      const chugLevel = ctx.createGain();
+      // On a disc this layer is the DOWNWASH rather than the exhaust, and it
+      // is the loudest thing a helicopter makes at close range — a rotor is
+      // mostly the sound of air being thrown at the ground.
+      chugLevel.gain.value = r ? 1.15 : 0.88;
+      noise.connect(chugTone).connect(chugLevel).connect(lump);
+
+      // The growl: the combustion tone at twice the firing rate, bent through
+      // an asymmetric soft clip. A sawtooth on its own is a buzz; what makes
+      // it iron is the distortion, and what makes the distortion big rather
+      // than merely dirty is that it is LOPSIDED — see `growlShape`. The
+      // highpass after it takes the fundamental back OUT again: what is wanted
+      // off this layer is the harmonics the shaper made, and the bottom octave
+      // is the chest note's job below rather than two layers stacked on one
+      // frequency.
+      const growl = ctx.createOscillator();
+      growl.type = "sawtooth";
+      growl.frequency.value = 12;
+      const growlDrive = ctx.createGain();
+      growlDrive.gain.value = 1.7;
+      const shaper = ctx.createWaveShaper();
+      shaper.curve = this.growlShape();
+      shaper.oversample = "2x";
+      const growlTone = ctx.createBiquadFilter();
+      growlTone.type = "lowpass";
+      growlTone.frequency.value = 500;
+      growlTone.Q.value = 0.8;
+      const growlEdge = ctx.createBiquadFilter();
+      growlEdge.type = "highpass";
+      growlEdge.frequency.value = 90;
+      const growlLevel = ctx.createGain();
+      // Nearly out of the way on a turbine: there is no combustion growl in a
+      // machine that burns continuously, and what is left of this layer there
+      // is the disc's own harmonics giving the thump an edge.
+      growlLevel.gain.value = r ? 0.13 : 0.32;
+      growl.connect(growlDrive).connect(shaper).connect(growlTone);
+      growlTone.connect(growlEdge).connect(growlLevel).connect(lump);
+
+      // The chest: a pure sine well above the growl, sitting on the hull
+      // resonance above. NOT at the growl's own pitch, which is where it
+      // started: at idle that is 26 Hz, a band most speakers cannot make a
+      // sound in at all, so it was heard as nothing and charged for as the
+      // loudest thing in the mix.
+      const chest = ctx.createOscillator();
+      chest.type = "sine";
+      chest.frequency.value = 30;
+      const chestLevel = ctx.createGain();
+      // Half again on a disc, and it lands square on the 92 Hz hull peak
+      // above: five blade passages is 95 Hz, which is the note a helicopter
+      // carries across a valley when everything over it has been lost.
+      chestLevel.gain.value = r ? 0.3 : 0.2;
+      chest.connect(chestLevel).connect(lump);
+
+      // The turbo. Two sines a few cents apart through a resonant peak: one
+      // sine is a test tone, and two beating against each other is a wheel.
+      // It bypasses the lump for the reason above, and its level starts at
+      // nothing because a cold turbo is not spinning.
+      const turboA = ctx.createOscillator();
+      turboA.type = "sine";
+      turboA.frequency.value = 700;
+      const turboB = ctx.createOscillator();
+      turboB.type = "sine";
+      turboB.frequency.value = 700;
+      turboB.detune.value = 11;
+      const turboTone = ctx.createBiquadFilter();
+      turboTone.type = "bandpass";
+      turboTone.frequency.value = 700;
+      // Broader on a turbine. A turbocharger is a wheel and a narrow peak is
+      // what makes it one; a turboshaft is a wheel inside a jet, and the same
+      // Q there is a whistle rather than an engine.
+      turboTone.Q.value = r ? 2 : 3.2;
+      const turboLevel = ctx.createGain();
+      turboLevel.gain.value = 0;
+      turboA.connect(turboTone);
+      turboB.connect(turboTone);
+      turboTone.connect(turboLevel).connect(out);
+      if (r) {
+        // …and the jet is AIR through the same peak. Two beating sines alone
+        // read as a test tone at the level a turboshaft has to sit at, and no
+        // amount of detune fixes that: what is missing is not beating but
+        // breadth. This costs one gain node and the noise source is already
+        // running for the wash.
+        const turbineAir = ctx.createGain();
+        turbineAir.gain.value = 0.85;
+        noise.connect(turbineAir).connect(turboTone);
+      }
+
+      // Track clatter: the same noise through a resonant band up where link
+      // meets link, gated on how fast the hull is actually going. It rides
+      // the lump too, so the rattle arrives in the same pulses the engine
+      // does — that is a tracked vehicle lurching, rather than a hiss laid
+      // over one.
+      const clatter = ctx.createBiquadFilter();
+      clatter.type = "bandpass";
+      clatter.frequency.value = 1700;
+      clatter.Q.value = 1.3;
+      const trackLevel = ctx.createGain();
+      trackLevel.gain.value = 0;
+      noise.connect(clatter).connect(trackLevel).connect(lump);
+
+      // The tail rotor: a small disc turning about five times as fast, and the
+      // second thing after the slap that says helicopter rather than merely
+      // aircraft. A SAWTOOTH read through a band well ABOVE its own
+      // fundamental, because what an ear picks a tail rotor out by is the rasp
+      // of its harmonics — the 93 Hz they hang off is underneath the main
+      // disc's own weight and would be heard as nothing at all.
+      //
+      // Onto the low cut rather than into the lump, and both halves of that
+      // are deliberate: a tail rotor is its own machine and is not chopped at
+      // the main disc's rate, and going in past `body` keeps its fundamental
+      // off a 92 Hz peak it would otherwise land square on.
+      let tail: OscillatorNode | null = null;
+      let tailLevel: GainNode | null = null;
+      if (r) {
+        tail = ctx.createOscillator();
+        tail.type = "sawtooth";
+        tail.frequency.value = 30;
+        const tailTone = ctx.createBiquadFilter();
+        tailTone.type = "bandpass";
+        tailTone.frequency.value = 780;
+        tailTone.Q.value = 1.6;
+        tailLevel = ctx.createGain();
+        tailLevel.gain.value = 0;
+        tail.connect(tailTone).connect(tailLevel).connect(lowCut);
+      }
+
+      const sources: AudioScheduledSourceNode[] = [
+        noise, fire, growl, chest, turboA, turboB,
+      ];
+      // On the list before anything starts, or it is a voice running unheard
+      // for the rest of the session — see the interface's header, which is the
+      // one rule this graph has.
+      if (tail) sources.push(tail);
+      for (const s of sources) s.start();
+      return {
+        kind, sources, out, panner, fire, fireDepth, growl, chest,
+        turbo: [turboA, turboB], chugTone, growlTone, turboTone, turboLevel,
+        trackLevel, tail, tailLevel,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * How hard the PLAYER's engine is working, once a frame for as long as they
+   * are aboard. `driveEngine` is the whole of it and carries the argument.
+   */
+  engineDrive(load: number, speed: number): void {
+    if (this.engine) this.driveEngine(this.engine, load, speed);
+  }
+
+  /**
+   * How hard one engine is working: `load` is the throttle 0..1 and `speed` is
+   * how much of the vehicle's top speed it is doing.
+   *
+   * Shared by both kinds of voice, and a hull nobody local is driving is given
+   * its own SPEED for both — see `hullEngine`, which cannot see anybody else's
+   * stick and does not pretend to.
+   *
+   * `level` scales the whole voice and is 1 for the hull the player is inside,
+   * which is the reference the levels below were tuned as. A spatialised one
+   * is louder at source because it is not heard at source: the panner has
+   * already taken it down by two thirds before a tank is even across the
+   * street, and a number tuned for something sitting in your head with no
+   * attenuation at all under it comes out as a machine you cannot hear.
+   *
+   * Both, not one, and they are asked different questions. SPEED is what the
+   * crank is doing, so it carries the pitch and it alone gates the track
+   * clatter — an engine revved on a stationary tank rattles no links. LOAD is
+   * how hard it is being worked, so it carries the level and both filters:
+   * standing on the throttle against a wall still sounds like work. A single
+   * term would make a stalled tank silent, which is the opposite of what a
+   * stalled tank sounds like.
+   *
+   * The pitch is not speed ALONE, though. A quarter of it is the throttle,
+   * because an engine lugging against a wall pulls down toward idle rather
+   * than holding the note it had rolling.
+   */
+  private driveEngine(
+    e: EngineVoice,
+    load: number,
+    turning: number,
+    level = 1,
+  ): void {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    // **The fork, and it is the data rather than the kind.** A rotor is not
+    // this voice with different numbers in it: the note is governed, so
+    // everything below that reads the machine's SPEED to decide a pitch is a
+    // sentence that is false about a helicopter. See `driveRotor`.
+    if (e.kind.rotor) {
+      this.driveRotor(e, e.kind.rotor, load, turning, level, t);
+      return;
+    }
+    const rev = Math.min(1, 0.75 * turning + 0.25 * load);
+    // The firing rate, and every pitched layer is a multiple of it so the
+    // engine changes note as one machine. 13 Hz is a lope you can count and 32
+    // is a diesel working; a real V12's firing rate is far above both, and
+    // taking it there trades the lump this voice is built on for a buzz.
+    //
+    // **`revMult` is the one thing a KIND changes about the note**, and it is a
+    // multiplier on this rather than on each layer below: every pitched layer
+    // is a multiple of the firing rate, so scaling it here revs the whole
+    // engine as one machine. A petrol truck at 1.55 idles where the tank's
+    // diesel is working, which is the whole of what tells the two apart from
+    // the next street.
+    const fire = (13 + 19 * rev) * e.kind.revMult;
+    e.fire.frequency.setTargetAtTime(fire, t, 0.14);
+    e.growl.frequency.setTargetAtTime(fire * 2, t, 0.12);
+    e.chest.frequency.setTargetAtTime(fire * 5, t, 0.12);
+    // Levels here are art and sit beside the rest of this file's, which are
+    // all literals for the same reason: what a layer is worth is decided by ear
+    // against the others, not by a number anybody would tune from outside.
+    //
+    // Ramped rather than assigned, or every frame is a click. 80 ms is short
+    // enough that the engine still answers the throttle inside a tenth of a
+    // second and long enough that no step in it is audible.
+    e.out.gain.setTargetAtTime((0.12 + 0.18 * load) * level, t, 0.08);
+    e.chugTone.frequency.setTargetAtTime(420 + 900 * load, t, 0.1);
+    e.growlTone.frequency.setTargetAtTime(500 + 1600 * load, t, 0.1);
+    // The turbo, whose whole character is that it is LATE. A tenth of a second
+    // is the rest of the engine answering the stick; six tenths is the wheel
+    // getting there. So a stab of throttle is heard as the engine first and
+    // the whistle arriving behind it, and letting go leaves the whistle
+    // running on for a moment after the growl has dropped — which is the one
+    // cue in the mix that says turbo rather than merely big.
+    const spool = Math.min(1, 0.45 * turning + 0.65 * load);
+    const hz = 700 + 1500 * spool;
+    e.turbo[0].frequency.setTargetAtTime(hz, t, 0.6);
+    e.turbo[1].frequency.setTargetAtTime(hz, t, 0.6);
+    e.turboTone.frequency.setTargetAtTime(hz, t, 0.6);
+    e.turboLevel.gain.setTargetAtTime(0.007 + 0.055 * spool, t, 0.55);
+    // …and `clatter` is the other, and it is not a level to be balanced: it is
+    // whether this thing runs on BELTS. At 0 the layer is silent and a wheeled
+    // vehicle is a wheeled vehicle; anything above 0 under one is a tank
+    // arriving that nobody can see.
+    e.trackLevel.gain.setTargetAtTime(
+      (0.006 + 0.045 * turning) * e.kind.clatter,
+      t,
+      0.12,
+    );
+  }
+
+  /**
+   * The same six sources driven as a TURBINE HANGING OFF A DISC, and the whole
+   * of what makes a helicopter one.
+   *
+   * `turning` here is the SPOOL — how fast the rotor is going round, 0..1 of
+   * governed — and `load` is DISC LOADING, how hard it is being worked. Both
+   * come off the hull itself; `Vehicle.powerplant` is where they are worked
+   * out and carries the argument for each.
+   *
+   * **The one sentence this method exists to make true: the note does not move
+   * with what the machine is doing.** A rotor is held at one speed by a
+   * governor, so a helicopter accelerating does not rev, a helicopter slowing
+   * does not fall away, and a helicopter HOVERING is at nearly full power and
+   * very nearly its loudest. Driving this voice off road speed said the
+   * opposite of all three — a machine that went quiet whenever it stopped
+   * moving, which is a machine flying with its engine switched off.
+   *
+   * So the two numbers are asked completely different questions from the ones
+   * a geared engine asks:
+   *
+   * | | geared to wheels | hung off a disc |
+   * | --- | --- | --- |
+   * | the NOTE | road speed and a quarter of the throttle | the spool, and nothing else |
+   * | the LEVEL | the throttle | the spool floor plus the disc loading |
+   * | the LUMP | a fixed depth | the loading — a worked disc chops harder |
+   * | the whistle | late, and swept by the throttle | governed, and swept by the spool alone |
+   *
+   * The spool is the one thing here that DOES move the note, and it is not an
+   * exception: a rotor coming up to speed is a rotor whose speed is changing.
+   * It is why the whole voice is written against `turning` rather than pinned
+   * at governed — the machine winds up over `flight.spoolTime`, in step with
+   * the disc the player is watching and with the moment it gets light on its
+   * skids, and winds down again when the pilot steps out.
+   */
+  private driveRotor(
+    e: EngineVoice,
+    r: NonNullable<EngineKind["rotor"]>,
+    load: number,
+    turning: number,
+    level: number,
+    t: number,
+  ): void {
+    // The blade rate, and a floor under it so a disc barely turning is a flap
+    // rather than a DC oscillator. `revMult` multiplies it for the reason it
+    // multiplies a firing rate: everything pitched in this voice is a multiple
+    // of one rate, so the machine spools as one machine.
+    const blade = r.slapHz * e.kind.revMult * (0.08 + 0.92 * turning);
+    // A quarter second, which is a twentieth of the spool it is following. Long
+    // enough that nothing in it steps, short enough that the whine arrives with
+    // the disc rather than behind it.
+    e.fire.frequency.setTargetAtTime(blade, t, 0.25);
+    e.growl.frequency.setTargetAtTime(blade * 2, t, 0.25);
+    e.chest.frequency.setTargetAtTime(blade * 5, t, 0.25);
+    if (e.tail) {
+      e.tail.frequency.setTargetAtTime(blade * r.tailRatio, t, 0.25);
+    }
+    // THE SLAP, and it is the load. This is the line a geared engine has no
+    // equivalent of: a throttle is heard in a diesel's filters because a
+    // cylinder firing is the same event however hard it is working, where a
+    // blade beating into its own wake is not — a loaded disc hits harder. The
+    // sign is negative for `buildEngine`'s reason: the bang first, the decay
+    // after it.
+    e.fireDepth.gain.setTargetAtTime(-(0.36 + 0.4 * load), t, 0.12);
+    // Loud at a HOVER. The spool term is what a machine hanging still over a
+    // street is worth before the pilot has asked it for anything, and it is
+    // most of the voice.
+    e.out.gain.setTargetAtTime(
+      (0.045 + 0.05 * turning + 0.2 * load) * level,
+      t,
+      0.1,
+    );
+    // The wash opens further than a diesel's does: what a loaded disc throws
+    // down is air, and air is broadband where exhaust is not.
+    e.chugTone.frequency.setTargetAtTime(380 + 1500 * load, t, 0.12);
+    e.growlTone.frequency.setTargetAtTime(420 + 900 * load, t, 0.12);
+    // The TURBINE, and it answers the spool alone — which is the whole of what
+    // "governed" means and is audible as the machine holding its note through
+    // a hard pull. The one exception is DROOP: a couple of per cent of sag
+    // under load, which is the cue that says there is a governor working
+    // rather than that the note is free to wander.
+    const hz = r.turbineHz * (0.22 + 0.78 * turning) * (1 - 0.025 * load);
+    // A tenth of a second rather than the turbocharger's six tenths. That lag
+    // was the whole character of a turbo — a wheel getting there after the
+    // engine had — and it is exactly wrong here: the spool is already IN
+    // `turning`, measured off the disc the player is watching, so a lag on top
+    // of it is a whine belonging to a rotor it has fallen behind.
+    e.turbo[0].frequency.setTargetAtTime(hz, t, 0.12);
+    e.turbo[1].frequency.setTargetAtTime(hz, t, 0.12);
+    e.turboTone.frequency.setTargetAtTime(hz, t, 0.12);
+    e.turboLevel.gain.setTargetAtTime(
+      0.006 + 0.1 * turning + 0.04 * load,
+      t,
+      0.12,
+    );
+    if (e.tailLevel) {
+      e.tailLevel.gain.setTargetAtTime(0.014 + 0.055 * turning, t, 0.12);
+    }
+    // `trackLevel` is deliberately not written, and it is not an omission: it
+    // was built at 0 and nothing hung off a rotor runs on belts. A kind that
+    // claimed both would be describing a machine that does not exist.
+  }
+
+  /**
+   * Out of the vehicle: the engine stops, and its nodes are let go.
+   * `stopEngine` is the wind-down and carries the argument for it.
+   */
+  engineOff(): void {
+    const e = this.engine;
+    if (!e) return;
+    // Dropped before the ramps rather than after them, so `engineOn` can build
+    // a fresh voice while this one is still winding down — getting straight
+    // back into the same hull is an ordinary thing for a player to do, and the
+    // two graphs are independent.
+    this.engine = null;
+    this.stopEngine(e);
+  }
+
+  /**
+   * Somebody ELSE's hull, and the gap this used to be is why it exists: a tank
+   * driven past you by a bot or by another player made no sound at all, and
+   * armour you cannot hear is armour that arrives from nowhere.
+   *
+   * The same graph as `engineOn`, spatialised, one voice per `key` and DRIVEN
+   * EVERY FRAME rather than opened on a mount and closed on a dismount. That
+   * is the difference that matters: what is being tracked here is not somebody
+   * getting in, it is a tank being within earshot, so the voice is built when
+   * one comes into range and torn down when it leaves. Which is also why there
+   * is no CATCH — the three one-shots `engineOn` fires are a starter motor
+   * turning over, and firing them on a range crossing would be a tank starting
+   * up once a street.
+   *
+   * `load` and `speed` are asked the way `Game.frameVehicleCamera` asks them
+   * for a GUNNER: the throttle belongs to whoever is holding the stick and
+   * nobody outside the hull can see it, so the hull's own speed is the honest
+   * answer to both. A stationary occupied hull idles, which is what a
+   * stationary occupied hull does.
+   *
+   * The rolloff is INVERSE, which it was alone in this file in being until
+   * the one-shot panner was moved onto the same model for the same reason —
+   * linear over a long range is a source as loud at fifty metres as at ten,
+   * and that is what makes an engine GROW as the thing arrives rather than
+   * simply exist until it doesn't.
+   *
+   * What is still its own is the PLATEAU: `CONFIG.audio.engineRef` (8 m)
+   * against a one-shot's 3, because a hull is not a point source — a tank is
+   * seven metres long, so there is no useful sense in which the listener is
+   * three metres from its engine. It carries `HULL_ENGINE_LEVEL` with it, so
+   * the two move together or a tank goes inaudible. The rolloff is a full 1
+   * here and 0.7 there for the opposite reason to the compromise made for
+   * one-shots: an engine is a continuous sound the player tracks by its
+   * growth, and it has `engineRange` (150 m) to grow across.
+   */
+  hullEngine(
+    key: number,
+    at: Vector3,
+    load: number,
+    speed: number,
+    kind: EngineKind,
+  ): void {
+    const ctx = this.ctx;
+    const bus = this.bus(kind.mix, "engine");
+    if (!ctx || !bus) return;
+    let voice = this.hullVoices.get(key);
+    const dist = this.distanceToListener(at);
+    // The gate, with a little hysteresis on the way back out — and the
+    // hysteresis is about the BUILD rather than about the sound. By the gate
+    // the rolloff has this voice below anything audible either way, so what a
+    // hull idling on the boundary would otherwise cost is a six-source graph
+    // torn down and stood back up every few frames.
+    if (dist > CONFIG.audio.engineRange * (voice ? 1.15 : 1)) {
+      this.hullEngineOff(key);
+      return;
+    }
+    if (!voice) {
+      const panner = ctx.createPanner();
+      panner.panningModel = "equalpower";
+      panner.distanceModel = "inverse";
+      panner.refDistance = CONFIG.audio.engineRef;
+      panner.rolloffFactor = 1;
+      panner.connect(bus.dry);
+      const built = this.buildEngine(bus, panner, kind);
+      if (!built) {
+        panner.disconnect();
+        return;
+      }
+      voice = built;
+      this.hullVoices.set(key, voice);
+    }
+    const p = voice.panner;
+    if (p) {
+      p.positionX.value = at.x;
+      p.positionY.value = at.y;
+      p.positionZ.value = at.z;
+    }
+    this.driveEngine(voice, load, speed, HULL_ENGINE_LEVEL);
+  }
+
+  /**
+   * One hull's engine away: it emptied, it burned, or it drove out of earshot.
+   * Idempotent, and it winds down rather than cutting for `stopEngine`'s
+   * reason — a tank leaving is a diesel receding, which is the same half
+   * second either way.
+   */
+  hullEngineOff(key: number): void {
+    const voice = this.hullVoices.get(key);
+    if (!voice) return;
+    this.hullVoices.delete(key);
+    this.stopEngine(voice);
+  }
+
+  /**
+   * Every hull engine at once, and it is owed by two callers that look
+   * unrelated and are not: a frame that did not STEP the fleet, and a map
+   * being torn down.
+   *
+   * A held world is a fleet whose speeds are frozen, so a voice left running
+   * under the deploy card is a tank droning in a street where nothing moves;
+   * and a fleet that stops existing takes none of its keys with it, so the
+   * per-frame `hullEngineOff` above would never be asked about them again.
+   *
+   * The PLAYER's own engine is deliberately not touched. That one is bracketed
+   * by a mount and a dismount rather than by a frame, and every path out of a
+   * seat already runs `engineOff`.
+   *
+   * A SUSPENDED clock is the one held world this does not answer, and refusing
+   * is the whole of why it knows about `paused` at all: the offline pause card
+   * stops the audio context, which is already holding these voices exactly as
+   * it holds the tail of the last shot. Stopping them as well would schedule a
+   * half-second wind-down that cannot run until the resume — so the frame the
+   * player comes back on would hear a dying engine under the fresh one this
+   * method's own caller immediately rebuilds.
+   */
+  enginesOff(): void {
+    if (this.paused) return;
+    for (const voice of this.hullVoices.values()) this.stopEngine(voice);
+    this.hullVoices.clear();
+  }
+
+  /**
+   * The wind-down, shared by both kinds of voice. The caller has already let
+   * go of it — see `engineOff` — so this only has to spend it.
+   *
+   * It is NOT cut on the frame the player steps down, or on the frame a hull
+   * leaves earshot. A diesel that is switched off falls through its own idle
+   * and stops turning over about half a second later, and a graph this
+   * sustained disappearing in one sample is the single moment the whole thing
+   * would sound synthesized. The wind-down is scheduled on the audio clock and
+   * the sources are stopped at the end of it, so a pause holds the shutdown
+   * exactly as it holds everything else.
+   */
+  private stopEngine(e: EngineVoice): void {
+    if (!this.ctx) return;
+    try {
+      const t = this.ctx.currentTime;
+      // The level is held where it actually is first: the last frame's own
+      // `setTargetAtTime` is still approaching a target, and ramping from a
+      // stale value would step.
+      e.out.gain.cancelScheduledValues(t);
+      e.out.gain.setValueAtTime(e.out.gain.value, t);
+      // A beat of it still running, then away. The pitch falls through the
+      // whole of it and the turbo dies first, because a wheel with no exhaust
+      // behind it stops long before the crank does.
+      e.out.gain.setTargetAtTime(0.0001, t + 0.16, 0.15);
+      e.turboLevel.gain.setTargetAtTime(0.0001, t, 0.1);
+      e.fire.frequency.setTargetAtTime(4, t, 0.28);
+      e.growl.frequency.setTargetAtTime(9, t, 0.28);
+      e.chest.frequency.setTargetAtTime(18, t, 0.28);
+      const stop = t + 0.6;
+      for (const s of e.sources) s.stop(stop);
+      // BOTH nodes: dropping only the gain leaves a panner wired to the master
+      // for the rest of the session — silent, and never collected.
+      e.sources[0].onended = () => {
+        e.out.disconnect();
+        e.panner?.disconnect();
+      };
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * A place in the world that makes a noise on its own — a burning drum, and
+   * whatever is added beside it.
+   *
+   * **This is `hullEngine`'s shape with a different budget, and the two are
+   * meant to be read together**: a graph held open behind a panner, keyed by
+   * whatever the caller uses to tell one emitter from another, called EVERY
+   * FRAME rather than when something starts, with the range gate and its
+   * hysteresis in here rather than at the call site. What differs is only
+   * what is being tracked — not somebody lighting a fire, but a fire being
+   * within earshot.
+   *
+   * **The caller decides WHICH emitters get a voice and this decides whether
+   * one is close enough to be worth building.** `AmbienceSystem` owns the
+   * ranking, because how many fires a map may hold is a question about the
+   * map and not about the graph.
+   *
+   * The hysteresis is the engine's, for the engine's reason and not for a
+   * sound one: by the gate the rolloff has this voice below anything audible
+   * either way, so what an emitter sitting on the boundary would otherwise
+   * cost is a three-source graph torn down and stood back up every few
+   * frames.
+   */
+  ambience(key: number, at: Vector3, kind: AmbienceKind): void {
+    const ctx = this.ctx;
+    // The kind's own family, not the caller's: a burning drum and a shoreline
+    // are one call and two rows on the mixer — see `AmbienceKind.mix`.
+    const bus = this.bus(kind.mix, "ambience");
+    if (!ctx || !bus) return;
+    let voice = this.ambienceVoices.get(key);
+    const dist = this.distanceToListener(at);
+    if (dist > kind.range * (voice ? 1.15 : 1)) {
+      this.ambienceOff(key);
+      return;
+    }
+    if (!voice) {
+      const panner = ctx.createPanner();
+      panner.panningModel = "equalpower";
+      panner.distanceModel = "inverse";
+      panner.refDistance = kind.refDistance;
+      panner.rolloffFactor = kind.rolloff;
+      panner.connect(bus.dry);
+      const built = this.buildAmbience(panner, kind);
+      if (!built) {
+        panner.disconnect();
+        return;
+      }
+      voice = built;
+      this.ambienceVoices.set(key, voice);
+      // Faded UP rather than switched on. A fire that arrives at full level on
+      // the frame it comes into range is the one moment the ranking behind it
+      // would be audible as a ranking.
+      voice.out.gain.setTargetAtTime(kind.level, ctx.currentTime, 0.25);
+    }
+    const p = voice.panner;
+    p.positionX.value = at.x;
+    p.positionY.value = at.y;
+    p.positionZ.value = at.z;
+  }
+
+  /** One emitter: out of range, or beaten to its slot. */
+  ambienceOff(key: number): void {
+    const voice = this.ambienceVoices.get(key);
+    if (!voice) return;
+    this.ambienceVoices.delete(key);
+    this.stopAmbience(voice);
+  }
+
+  /**
+   * Every one at once, and it is owed by exactly one caller: a map being torn
+   * down, which takes none of its keys with it, so the per-frame
+   * `ambienceOff` above would never be asked about them again.
+   *
+   * **Unlike `enginesOff` this is NOT owed by a frame that held the world**,
+   * and the difference between the two is the whole argument for where the
+   * push lives. An engine's voice is driven by a parameter a held world
+   * freezes — a stopped fleet is a hull droning at a load nobody is asking
+   * for — so a frame that did not step it owes those SILENCE. A fire is
+   * driven by nothing at all: it is a property of the map being installed and
+   * the listener being somewhere, which every state that renders has. A
+   * village does not go quiet because a kit screen is up.
+   *
+   * The suspended clock is the one held world neither of them answers, and
+   * for the same reason: the offline pause card stops the audio context,
+   * which is already holding this graph exactly as it holds the tail of the
+   * last shot.
+   */
+  ambienceAllOff(): void {
+    if (this.paused) return;
+    for (const voice of this.ambienceVoices.values()) this.stopAmbience(voice);
+    this.ambienceVoices.clear();
+  }
+
+  /**
+   * The ambience graph, and the same bargain the engine makes one subsystem
+   * over — see `buildEngine`, whose header rule is this one's too. Nothing
+   * here is scheduled. The only things that repeat are buffer sources
+   * looping, which is the audio clock's business rather than the frame's, and
+   * they stop with that clock like everything else.
+   *
+   * **A fire is a low ROAR, a high hump, and EVENTS — with a hole in the
+   * middle.** That last part is measured rather than designed: the reference
+   * recording's octave bands run 63 Hz -4.1 dB, 125 -5.2, 250 -10.2, then
+   * **500 -21.2 and 1k -19.5**, then back up to 4k -11.8 and 8k -11.5. Two
+   * humps and a fifteen-decibel hole between them. Nothing here fills that
+   * hole and nothing here should: a 12 dB/octave lowpass at `roarHz` and a
+   * bandpass whose skirt starts an octave and a half above it leave it there
+   * for free.
+   *
+   * **AND RUNNING WATER IS EXACTLY THAT HOLE.** The water reference peaks at
+   * 1 kHz — dead centre of the two octaves the fire has almost nothing in —
+   * and falls away hard on both sides, which is why the second kind built out
+   * of this method needed no term the first did not have and needed its terms
+   * pointed somewhere else entirely. It is also why a burning drum on a
+   * quayside does not mask the sea beside it.
+   *
+   * | layer | a fire | water |
+   * | --- | --- | --- |
+   * | roar — lowpassed noise | the column of air the drum is moving | the shore's surf rumble; a brook has none |
+   * | bands — the SAME noise through humps | one: sap, ash and small stuff | two: the rush, and the spray over it |
+   * | breath — a slow modulator on all of them | a fire is not steady | the WAVE, on a shore |
+   * | sparks — impulses ringing resonators | the crackles | the gurgles and plops |
+   *
+   * **The roar and every hump are one source read through several filters**,
+   * which is where a source was saved: noise is broadband, so a second
+   * buffer player buys two filters' worth of independence and nothing an ear
+   * can find. The BREATH is a source of its own for the opposite reason, and
+   * a BUFFER of its own as well: a modulator tapped off the one-second noise
+   * read at 0.33 repeats every three seconds, and a three-second breathing
+   * pattern is exactly the kind of thing an ear catches — while a modulator
+   * FILTERED to a sub-hertz wander is a recursion that measurably runs away
+   * (`buildBreathBuffer`).
+   *
+   * **A HUMP IS A ROW, AND THAT IS NOT TIDINESS — IT IS THE ONE THING THE
+   * EVENT ROWS CANNOT STAND IN FOR.** The first fit of the brook tried to
+   * carry its 2.5–16 kHz shelf on dense spark rows, which is the fire's own
+   * lesson applied in the wrong direction. It does not work and it cannot:
+   * an impulse train dense enough to read as a bed is no longer isolated
+   * impulses, the threshold that selects them widens into clusters, and the
+   * source those clusters are cut from is band-limited by its own playback
+   * rate. Measured, the top three octaves came in 4 to 8 dB under a fit whose
+   * arithmetic said they were right. The fix was a second `BandSpec`, and it
+   * took the brook's third-octave error from 2.9 dB rms to 1.1.
+   *
+   * **A CRACKLE IS AN IMPULSE RINGING A RESONATOR**, and that is the whole
+   * of what makes this sound like a fire rather than like a firefight two
+   * streets away. The first version of this graph gated a continuous
+   * resonant band with a lowpassed noise, which cannot work and could not
+   * have been tuned into working: a gate built out of a band-limited signal
+   * opens as slowly as its own bandwidth, so every event had a soft attack,
+   * the same length, the same pitch and nearly the same level. Measured, it
+   * gave 9.4 events a second at 1500 Hz with millisecond attacks, against a
+   * real fire's 24.7 a second at 7 kHz attacking in 0.15 ms — and a
+   * soft-attacked mid-band transient at an even rate is not a near-miss for
+   * a crackle, it is a good imitation of a distant rifle.
+   *
+   * So `sparkShape` thresholds the shared noise buffer SAMPLE BY SAMPLE with
+   * no filter in front of it. A single sample survives as a single-sample
+   * impulse — the attack is exact by construction rather than tuned — and
+   * that train excites a bandpass whose ring is the decay. Three properties
+   * fall out for free rather than being dialled in: the attack, the impulse
+   * heights (uniform on (0, 1], which is the 14 dB of level spread the
+   * reference has), and the fact that nothing is scheduled.
+   *
+   * **The rows are a LIST because one pitch repeated is the other half of
+   * the gunfire read.** Two chains at different playback rates read
+   * different slices of the buffer, so their events neither coincide nor
+   * share a timbre. A third is a third row in `CONFIG.audio.ambience.fire`
+   * and no code here at all — and a kind with an empty list is a wind in a
+   * canopy, which is `EngineKind.rotor`'s bargain made again: what a thing
+   * sounds like is a row, never a branch. **A gurgle is the same mechanism
+   * spent on a different physics**: a bubble in water is a resonator struck
+   * once and left to ring, exactly as a snapping fibre is, so the brook's
+   * rows differ from the fire's in nothing but where they ring and how often
+   * — 560 Hz at Q 14 for a plop, which is an 18 ms ringdown and about what
+   * the Minnaert relation gives for a bubble that size.
+   *
+   * It comes up SILENT — `ambience` fades it in, for the reason stated there.
+   */
+  private buildAmbience(
+    panner: PannerNode,
+    kind: AmbienceKind,
+  ): AmbienceVoice | null {
+    const ctx = this.ctx;
+    if (!ctx || !this.noiseBuffer || !this.breathBuffer) return null;
+    try {
+      const out = ctx.createGain();
+      out.gain.value = 0;
+      out.connect(panner);
+
+      // The one source the roar and the sizzle share. A third of speed for
+      // the same reason the engine's chug runs slow: the shared one-second
+      // buffer then loops every three, under filters that leave no seam an
+      // ear can find.
+      const base = ctx.createBufferSource();
+      base.buffer = this.noiseBuffer;
+      base.loop = true;
+      base.playbackRate.value = 0.33;
+
+      const roarTone = ctx.createBiquadFilter();
+      roarTone.type = "lowpass";
+      roarTone.frequency.value = kind.roarHz;
+      roarTone.Q.value = 0.7;
+      const roarLevel = ctx.createGain();
+      roarLevel.gain.value = kind.roarLevel;
+      base.connect(roarTone).connect(roarLevel).connect(out);
+
+      // The humps get a source of THEIR OWN, read at full speed, and the
+      // reason is bandwidth rather than decorrelation: a buffer played at
+      // 0.33 has no content above a third of Nyquist, so the roar's source
+      // is silent over about 8 kHz. Measured, that put the 16 kHz octave
+      // 11.4 dB under where the fire reference has it — a fire with the top
+      // cut off it, which is most of the difference between sizzling and
+      // rushing. It loops every second and nothing can hear that, because
+      // what is left after these bandpasses is noise.
+      //
+      // ONE source for every hump, for the reason the roar shares it: noise
+      // is broadband, so a second buffer player buys two filters' worth of
+      // independence and nothing an ear can find.
+      const bandSrc = ctx.createBufferSource();
+      bandSrc.buffer = this.noiseBuffer;
+      bandSrc.loop = true;
+      bandSrc.playbackRate.value = 1;
+      const bandLevels: GainNode[] = [];
+      for (const band of kind.bands) {
+        // In SERIES, and the count is the row's — see `BandSpec.stages`. Two
+        // of a wide bandpass is a steep-skirted plateau, which is what a
+        // brook's spectrum is and what no single biquad can be.
+        let tone: AudioNode = bandSrc;
+        for (let s = 0; s < band.stages; s++) {
+          const f = ctx.createBiquadFilter();
+          f.type = "bandpass";
+          f.frequency.value = band.hz;
+          f.Q.value = band.q;
+          tone = tone.connect(f);
+        }
+        // DRIVEN, and the base value is the floor rather than the level: an
+        // AudioParam sums its scheduled value with whatever is connected to
+        // it, so the breath below swings this about `band.level` rather than
+        // scaling it.
+        const level = ctx.createGain();
+        level.gain.value = band.level;
+        tone.connect(level).connect(out);
+        bandLevels.push(level);
+      }
+
+      // The breath: one loop of slow wander spent on the humps and the bottom
+      // together, at its own rate.
+      //
+      // **The wander is BAKED and the rate is a playback rate**, which is the
+      // trick the bed above already plays on the shared noise buffer — and it
+      // is load-bearing rather than tidy: asked of a live `BiquadFilterNode`,
+      // the shore's 0.28 Hz corner is a float32 double integrator that
+      // measurably runs away, and the emitter it runs away in is the one that
+      // never gets torn down. `buildBreathBuffer` carries the measurement.
+      const breath = ctx.createBufferSource();
+      breath.buffer = this.breathBuffer;
+      breath.loop = true;
+      breath.playbackRate.value = kind.breathHz / BREATH_WANDER_HZ;
+      // A depth is a SHARE of the level it swings, like `SparkSpec.level`, so
+      // `BandSpec.breath` is a number that can be reasoned about rather than
+      // a magic one — and here that is simply the depth, because the buffer
+      // is unit RMS by construction.
+      //
+      // It is worth knowing WHY that matters, because the term once did
+      // nothing at all: a modulator arriving at ~0.023 RMS swings a bed by
+      // about one per cent, and a depth stated as a plain multiplier is
+      // invisible in a listen and invisible in a diff — rendered, the fire's
+      // hump depth at 0.55 and at 1.0 gave a bed breathing 1.51x and 1.50x.
+      // What used to divide it back out was an ESTIMATE of the filter's own
+      // noise bandwidth, 4 to 10% out where it was measured; normalising the
+      // buffer instead makes it exact.
+      kind.bands.forEach((band, i) => {
+        const depth = ctx.createGain();
+        depth.gain.value = band.breath * band.level;
+        breath.connect(depth).connect(bandLevels[i].gain);
+      });
+      // …and a share of the SAME breath on the bottom. One signal rather than
+      // one per term, because a draught is one event: the flame and the
+      // column of air over it surge together, and so do a wave and the foam
+      // on it. A depth PER TERM, because they do not surge by the same
+      // amount, and moving them all by one fraction is what reads as somebody
+      // turning a volume knob rather than as weather. How far apart they are
+      // is itself a claim about the sound: a fire's differ by 3.4x, because
+      // its draught moves the small stuff and the column barely notices, and
+      // the shore's are within a third of each other, because a wave moves
+      // the whole body of water at once.
+      const roarBreath = ctx.createGain();
+      roarBreath.gain.value = kind.breathRoarDepth * kind.roarLevel;
+      breath.connect(roarBreath).connect(roarLevel.gain);
+
+      const sources: AudioScheduledSourceNode[] = [base, bandSrc, breath];
+
+      // The crackles. One chain per row, and no row knows about any other.
+      for (const spark of kind.sparks) {
+        // The one thing about a row that fails SILENTLY, so it is checked
+        // rather than only written down — see `SparkSpec.rate`.
+        if (
+          import.meta.env.DEV &&
+          !Number.isInteger(Math.log2(spark.rate))
+        ) {
+          console.warn(
+            `ambience: spark rate ${spark.rate} is not a power of two — this row will be quiet or silent. See SparkSpec.rate.`,
+          );
+        }
+        const src = ctx.createBufferSource();
+        src.buffer = this.noiseBuffer;
+        src.loop = true;
+        src.playbackRate.value = spark.rate;
+        // A whole number of samples, so a wrap cannot leave the read position
+        // on a fraction — see `SparkSpec.loop`.
+        src.loopStart = 0;
+        src.loopEnd = Math.round(spark.loop * ctx.sampleRate) / ctx.sampleRate;
+        const shaper = ctx.createWaveShaper();
+        // NO oversampling. It is the default, and it is stated because it is
+        // load-bearing here and nowhere else in this file: oversampling
+        // filters the signal on the way in and out, which would round off
+        // the single-sample impulse this whole layer is built on.
+        shaper.oversample = "none";
+        shaper.curve = this.sparkShape(
+          sparkThreshold(spark.hz, ctx.sampleRate, spark.rate),
+        );
+        const ring = ctx.createBiquadFilter();
+        ring.type = "bandpass";
+        ring.frequency.value = spark.ringHz;
+        ring.Q.value = spark.ringQ;
+        const level = ctx.createGain();
+        // NORMALISED, so `level` is a level rather than a magic number.
+        //
+        // A single-sample impulse into a bandpass does not come out at the
+        // height it went in at — the filter's own impulse response opens at
+        // `alpha / (1 + alpha)`, which at 7.2 kHz and Q 11 is about 0.036.
+        // So the first cut of this graph, at a stated level of 0.5, put its
+        // crackles 12 dB UNDER the bed and the rendered events stood 2.0 dB
+        // out of it against the reference's 9.8. Dividing it back out makes
+        // `spark.level` the peak of a full-height crackle, which is a number
+        // that can be reasoned about and compared between rows — and it
+        // tracks Q and the sample rate on its own, so retuning a resonance
+        // no longer silently retunes the mix.
+        const w0 = (2 * Math.PI * spark.ringHz) / ctx.sampleRate;
+        const alpha = Math.sin(w0) / (2 * spark.ringQ);
+        level.gain.value = spark.level * ((1 + alpha) / Math.max(1e-4, alpha));
+        src.connect(shaper).connect(ring).connect(level).connect(out);
+        sources.push(src);
+      }
+
+      // On the list before anything starts — `EngineVoice.sources`' rule, and
+      // it is the same rule for the same reason: a source started without a
+      // place on it is a voice running unheard for the rest of the session.
+      for (const src of sources) src.start();
+      return { sources, out, panner };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The spark's transfer curve: zero everywhere except the extreme tips,
+   * where it ramps to one. Cached per threshold for the reason the noise
+   * buffer and the combustion shaper are cached at all.
+   *
+   * **The table is enormous on purpose and that is the one detail here that
+   * is easy to get wrong.** A `WaveShaper` indexes its curve by the INPUT
+   * sample, so the resolution of the threshold is the resolution of the
+   * table: at the usual 1024 points the finest threshold expressible is
+   * about 0.998, which fires on two samples in a thousand — ninety-six
+   * events a second, an order of magnitude past a fire. `SPARK_CURVE_POINTS`
+   * (32768) resolves 6.1e-5, which puts a fifteen-a-second threshold four
+   * points inside the top of the table. It is 128 KB, built once per
+   * threshold and shared by every emitter after that.
+   *
+   * Rectifying is deliberate: the noise is signed and a fibre does not care
+   * which way it snaps, so both tips are events. Below the threshold the
+   * curve is FLAT ZERO rather than merely small, which is what makes the
+   * silence between crackles actually silent — the resonator downstream is
+   * excited by nothing at all until an impulse arrives, so its ring is the
+   * whole of what is heard.
+   */
+  private sparkShape(threshold: number): Float32Array<ArrayBuffer> {
+    const cached = this.sparkCurves.get(threshold);
+    if (cached) return cached;
+    const n = SPARK_CURVE_POINTS;
+    const curve = new Float32Array(n);
+    const span = Math.max(1e-6, 1 - threshold);
+    for (let i = 0; i < n; i++) {
+      const u = Math.abs((i / (n - 1)) * 2 - 1);
+      curve[i] = u <= threshold ? 0 : (u - threshold) / span;
+    }
+    this.sparkCurves.set(threshold, curve);
+    return curve;
+  }
+
+  /**
+   * The fade-out, and it is longer than it needs to be on purpose.
+   *
+   * A fire has no wind-down of its own — it is not a machine being switched
+   * off — so what this spends is not mechanism but CONCEALMENT: the moment it
+   * runs is a ranking decision, an emitter losing its slot or dropping out of
+   * range, and that is the one thing about the whole system the player must
+   * never be able to hear. Three quarters of a second of `setTargetAtTime`
+   * under a rolloff that already has it near the floor is inaudible; a cut is
+   * a click.
+   */
+  private stopAmbience(v: AmbienceVoice): void {
+    if (!this.ctx) return;
+    try {
+      const t = this.ctx.currentTime;
+      // Held where it actually is first: a voice stopped during its own
+      // fade-IN is still approaching a target, and ramping from a stale value
+      // would step. `stopEngine`'s first three lines, for its reason.
+      v.out.gain.cancelScheduledValues(t);
+      v.out.gain.setValueAtTime(v.out.gain.value, t);
+      v.out.gain.setTargetAtTime(0.0001, t, 0.2);
+      const stop = t + 0.75;
+      for (const src of v.sources) src.stop(stop);
+      // BOTH nodes: dropping only the gain leaves a panner wired to the master
+      // for the rest of the session — silent, and never collected.
+      v.sources[0].onended = () => {
+        v.out.disconnect();
+        v.panner.disconnect();
+      };
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * The combustion tone's distortion curve, built on the first mount and then
+   * shared — the noise buffer's rule, for the noise buffer's reason.
+   *
+   * **Asymmetric on purpose.** A symmetric clip folds a sawtooth into odd
+   * harmonics only, which is a rasp; offsetting the curve puts EVEN ones in
+   * beside them, and the even harmonics are the difference between an engine
+   * that sounds big and one that just sounds dirty. The offset is subtracted
+   * back out at zero, so the curve passes zero through and adds no DC of its
+   * own at rest.
+   */
+  private growlShape(): Float32Array<ArrayBuffer> {
+    if (this.growlCurve) return this.growlCurve;
+    const curve = new Float32Array(1024);
+    const k = 2.4;
+    const bias = 0.14;
+    const zero = Math.tanh(k * bias);
+    // Normalised by the curve's own PEAK and not by the span of one half of
+    // it, which is worth stating because getting that wrong does not look like
+    // a bug: dividing by the positive half's span left the negative half with
+    // a gain of TEN, and what that sounds like is an engine — a very loud one,
+    // drowning every other layer by 26 dB, with the whole mix under 90 Hz.
+    let peak = 0;
+    for (let i = 0; i < curve.length; i++) {
+      const u = (i / (curve.length - 1)) * 2 - 1;
+      const y = Math.tanh(k * (u + bias)) - zero;
+      curve[i] = y;
+      peak = Math.max(peak, Math.abs(y));
+    }
+    for (let i = 0; i < curve.length; i++) curve[i] /= peak;
+    this.growlCurve = curve;
+    return curve;
+  }
+
+  /**
+   * Somebody else working their magazine. The player's own reload is flat and
+   * front-and-centre; this one is spatialised, because knowing *which* of the
+   * enemies in front of you has just gone dry is the point of hearing it — it
+   * is the cue to push. Fixed offsets rather than the player's fractions: bot
+   * reload time is a per-bot skill value and this only has a position.
+   *
+   * `voice` is the shooter's mechanism, and it turns the cue from "somebody is
+   * reloading" into "somebody with an LMG is reloading", which is a rather
+   * different sentence: it is the difference between a second and a half of
+   * window and three and a half.
+   */
+  botReload(at: Vector3, voice: ReportVoice = FLAT_REPORT): void {
+    const bus = this.bus("botReload", "mechanism");
+    const dist = this.distanceToListener(at);
+    if (dist > CONFIG.audio.maxDistance) return;
+    const panner = this.panner(bus, at);
+    if (!panner) return;
+    const delay = dist / CONFIG.audio.speedOfSound;
+    const p = voice.actionPitch;
+    const g = voice.actionVol;
+    this.clack(bus, 2200 * p, 0.5 * g, delay, panner);
+    this.clack(bus, 760 * p, 0.6 * g, delay + 0.3, panner);
+    this.clack(bus, 3100 * p, 0.45 * g, delay + 0.55, panner);
+  }
+
+  /**
+   * A bot's boot, out in the village. Spatialised, and cut off far short of
+   * `maxDistance` (`CONFIG.audio.footstep.botRange`) — see that field for why.
+   *
+   * One layer, not the player's two: the scuff is the first thing the air and
+   * the distance take off a footstep, and past a few metres all that is left
+   * is the thud. Skipping it also halves what a squad jogging past costs.
+   *
+   * No propagation delay either, unlike `botShot`. At 20 m that is 58 ms — far
+   * too small to read as distance, and it would only smear the one thing this
+   * sound is for, which is knowing that someone is moving *now*, close, and
+   * roughly over there.
+   */
+  botStep(at: Vector3): void {
+    const bus = this.bus("botStep", "footstep");
+    const f = CONFIG.audio.footstep;
+    const dist = this.distanceToListener(at);
+    if (dist > f.botRange) return;
+    const panner = this.panner(bus, at);
+    if (!panner) return;
+    const v = 0.85 + Math.random() * 0.3;
+    // Fades out over its own range rather than the panner's much longer one,
+    // so the last audible steps trail off instead of being cut mid-stride.
+    const far = dist / f.botRange;
+    this.burst(bus, {
+      dur: 0.075, vol: 0.34 * (1 - far * 0.6), type: "lowpass", freq: 380 * v,
+      freqEnd: 110, out: panner, send: 0.15,
+    });
+  }
+
+  // --- primitives ----------------------------------------------------------
+
+  /**
+   * Fetches and decodes every row of `SAMPLE_URLS`, once per session.
+   *
+   * Each row is independent — one file failing must not cost the others their
+   * sample — and a failure of any kind is swallowed for the reason every other
+   * `try` in this file is: audio is not allowed to take the game down, and the
+   * consequence of losing a row here is a weapon that sounds the way it always
+   * did.
+   *
+   * The buffers are held for the life of the process, exactly as the noise
+   * buffer and the impulse response are. There is no eviction and there should
+   * not be one: this is a handful of seconds of audio, and a shot that has to
+   * wait on a fetch is a shot that arrives after the round it belongs to.
+   */
+  private async loadSamples(): Promise<void> {
+    if (this.samplesRequested) return;
+    this.samplesRequested = true;
+    const ctx = this.ctx;
+    if (!ctx) return;
+    const ids = Object.keys(SAMPLE_URLS) as SampleId[];
+    await Promise.all(ids.map(async (id) => {
+      try {
+        const res = await fetch(SAMPLE_URLS[id]);
+        if (!res.ok) return;
+        const buffer = await ctx.decodeAudioData(await res.arrayBuffer());
+        this.samples.set(id, { buffer, ...trimSample(buffer) });
+      } catch {
+        // A weapon with no sample is a weapon with a synthesized report.
+      }
+    }));
+  }
+
+  /**
+   * Plays a recording, or reports that there is not one to play.
+   *
+   * **The return value is the whole of the fallback and it is deliberately not
+   * a boolean about SUCCESS.** `false` means "no such sample, synthesize the
+   * shot"; a sample that exists and is then refused by the voice cap returns
+   * `true`, because falling through to five synthesized layers at the exact
+   * moment the graph is out of voices would make a busy firefight LOUDER than
+   * a quiet one. A refusal is a refusal either way.
+   *
+   * Everything else here is `burst`'s bookkeeping with a real buffer in place
+   * of a noise slice: the same voice counting, the same reverb tap taken
+   * pre-panner, the same scheduling on the audio clock rather than a timeout.
+   * `rate` is `playbackRate` and therefore pitch AND length together, which is
+   * what a resampled recording is — it is not `ReportVoice.pitch`'s equal, and
+   * a weapon leaning on it hard enough to hear is a weapon that wants its own
+   * file.
+   */
+  private sample(bus: MixBus | null, id: SampleId, o: {
+    vol: number;
+    /** `playbackRate`: pitch and duration together. 1 is the file as cut. */
+    rate?: number;
+    /** Seconds from now, on the audio clock. */
+    delay?: number;
+    out?: AudioNode | null;
+    /** Level into the shared environment reverb, pre-panner. */
+    send?: number;
+    /** Exempt from the voice cap — still counted. See `shoot`. */
+    keep?: boolean;
+    /** An optional one-pole-ish air absorption filter over the whole thing. */
+    lowpass?: number;
+  }): boolean {
+    const s = this.samples.get(id);
+    if (!s) return false;
+    if (!this.ctx || !bus) return true;
+    if (!o.keep && this.voices >= CONFIG.audio.maxVoices) return true;
+    try {
+      const t0 = this.ctx.currentTime + (o.delay ?? 0);
+      const rate = o.rate ?? 1;
+      const src = this.ctx.createBufferSource();
+      src.buffer = s.buffer;
+      src.playbackRate.value = rate;
+      const gain = this.ctx.createGain();
+      gain.gain.value = o.vol;
+      let head: AudioNode = src;
+      if (o.lowpass) {
+        const f = this.ctx.createBiquadFilter();
+        f.type = "lowpass";
+        f.frequency.value = o.lowpass;
+        f.Q.value = 0.7;
+        src.connect(f);
+        head = f;
+      }
+      head.connect(gain).connect(o.out ?? bus.dry);
+      this.send(bus, gain, o.send);
+      this.voices += 1;
+      src.onended = () => {
+        this.voices -= 1;
+      };
+      // Both ends of the trim are spent here. Both arguments are in the
+      // BUFFER's own seconds rather than the output's — `playbackRate` then
+      // decides how long that takes to play — so neither is scaled by `rate`.
+      src.start(t0, s.offset, s.duration);
+    } catch {
+      // ignore
+    }
+    return true;
+  }
+
+  private buildNoiseBuffer(): void {
+    if (!this.ctx) return;
+    const rate = this.ctx.sampleRate;
+    const buffer = this.ctx.createBuffer(1, rate, rate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+    this.noiseBuffer = buffer;
+  }
+
+  /**
+   * The ambience BREATH: one loop of slow wander, smoothed here rather than
+   * by a filter in the live graph, and normalised to unit RMS.
+   *
+   * **It was a `BiquadFilterNode` lowpass on the shared noise, and at the
+   * shore's 0.28 Hz that filter RUNS AWAY.** A two-pole lowpass at
+   * `fc / fs = 5.8e-6` has both poles within 3.7e-5 of z = 1, which is a
+   * double integrator with a rounding error going into it: the state is
+   * float32, the residue is integrated twice, and the walk has no restoring
+   * force worth the name. Measured over 300-second renders of that filter
+   * alone, THREE of six diverged — a DC offset that appears after ten or
+   * fifteen seconds and then climbs without bound, past ±4 by the end.
+   * Nothing about it is audio; it is the recursion drifting.
+   *
+   * What that cost is the whole point of the fix. The breath is spent on the
+   * band and roar gains through a makeup of `depth / rms` — 26x on the
+   * shore's swash — so a DC of 4 arrives as a band gain of 105 against a
+   * nominal 0.46, and the water comes up some 40 dB hot and still rising. It
+   * is the one voice in the game that can do this, for the one reason that
+   * matters: an emitter that never loses its slot is never torn down, so the
+   * filter state is never reset, and a marsh map's waterline holds its slot
+   * for a whole match. Rebuilt every few minutes, as a fire is when you walk
+   * past it, it would never have shown.
+   *
+   * So the same shape is built ONCE, in doubles, where there is no recursion
+   * left to drift: two one-pole passes, which is EXACTLY what the biquad was
+   * (a lowpass at Q 0.5 is two coincident real poles at the corner), run
+   * CYCLICALLY so the loop has no seam. The rate is then the source's
+   * `playbackRate` rather than a filter corner, which is the trick the bed
+   * already plays on the shared noise buffer — and 0.28 Hz is nothing
+   * special to a buffer read slowly.
+   *
+   * **Normalised to unit RMS, which retires the estimate the makeup used to
+   * divide by.** That estimate (`0.577 * sqrt(...)`) was the noise-bandwidth
+   * arithmetic for the filter it no longer has, and it was 4 to 10% out
+   * where it was measured — so `BandSpec.breath` and `breathRoarDepth` are
+   * now exactly the fraction of their own level that they say they are.
+   */
+  private buildBreathBuffer(): void {
+    if (!this.ctx) return;
+    const n = Math.round(BREATH_SECONDS * BREATH_BUFFER_RATE);
+    const buffer = this.ctx.createBuffer(1, n, BREATH_BUFFER_RATE);
+    // In doubles, and only the last wrap is kept: the first two are what put
+    // the filter in its steady state at the buffer's START, which is what
+    // makes the loop seamless — a smoothed buffer whose ends do not meet is
+    // a step on a gain param once a loop, and this one loops for the length
+    // of a match.
+    const work = new Float64Array(n);
+    for (let i = 0; i < n; i++) work[i] = Math.random() * 2 - 1;
+    const a = Math.exp((-2 * Math.PI * BREATH_WANDER_HZ) / BREATH_BUFFER_RATE);
+    for (let pass = 0; pass < 2; pass++) {
+      let y = 0;
+      for (let wrap = 0; wrap < 3; wrap++) {
+        for (let i = 0; i < n; i++) {
+          y = y * a + work[i] * (1 - a);
+          if (wrap === 2) work[i] = y;
+        }
+      }
+    }
+    // Centred and scaled to unit RMS, so a depth is a depth. The mean matters
+    // in its own right: this signal is SUMMED into a gain param, so a DC
+    // offset here is a term's level quietly moved.
+    let mean = 0;
+    for (let i = 0; i < n; i++) mean += work[i];
+    mean /= n;
+    let sq = 0;
+    for (let i = 0; i < n; i++) {
+      work[i] -= mean;
+      sq += work[i] * work[i];
+    }
+    const rms = Math.sqrt(sq / n) || 1;
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < n; i++) data[i] = work[i] / rms;
+    this.breathBuffer = buffer;
+  }
+
+  /**
+   * The village's impulse response: a handful of discrete slaps off the
+   * nearest walls, then a decaying diffuse tail. Built once.
+   *
+   * Two details carry it. The tail is run through a one-pole lowpass as it is
+   * written, because air and stone eat the top end first — an undarkened noise
+   * tail is a hiss, which reads as tape, not as a valley. And the two channels
+   * get independent noise and different early-reflection times: identical
+   * channels collapse to a point between your ears, and the whole reason a
+   * gunshot sounds outdoors is that its tail comes from everywhere at once.
+   */
+  private buildImpulse(): void {
+    if (!this.ctx || !this.reverb) return;
+    const rate = this.ctx.sampleRate;
+    const len = Math.floor(rate * CONFIG.audio.reverbSeconds);
+    const ir = this.ctx.createBuffer(2, len, rate);
+    // Milliseconds and amplitude of the early reflections, per channel.
+    const early = [
+      [13, 0.5, 29, 0.36, 48, 0.26, 71, 0.18, 104, 0.12],
+      [19, 0.46, 34, 0.33, 57, 0.24, 83, 0.17, 119, 0.11],
+    ];
+    for (let ch = 0; ch < 2; ch++) {
+      const d = ir.getChannelData(ch);
+      let lp = 0;
+      for (let i = 0; i < len; i++) {
+        const t = i / len;
+        lp += 0.3 * (Math.random() * 2 - 1 - lp);
+        // Squared falloff reaching exactly zero at the end, so the tail can
+        // never click off.
+        d[i] = lp * (1 - t) * (1 - t) * 0.6;
+      }
+      const table = early[ch];
+      for (let k = 0; k < table.length; k += 2) {
+        const at = Math.floor((rate * table[k]) / 1000);
+        if (at < len) d[at] += table[k + 1];
+      }
+    }
+    this.reverb.buffer = ir;
+  }
+
+  private distanceToListener(at: Vector3): number {
+    const dx = at.x - this.lx;
+    const dy = at.y - this.ly;
+    const dz = at.z - this.lz;
+    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+  }
+
+  /**
+   * A distance-attenuated output node, or null when the voice budget is
+   * spent. **This one method is the near-field mix for every world sound in
+   * the game** — every gunshot but the player's own, every impact, footstep,
+   * blast, break and reload — so the curve on it is a design decision rather
+   * than a default.
+   *
+   * **It is INVERSE, and it was LINEAR, and that is the fix for a mix in
+   * which somebody else's rifle ten metres away arrived within 2 dB of your
+   * own.** A linear rolloff spreads its whole range evenly, so with a
+   * `refDistance` of 8 m over a `maxDistance` of 70 everything inside a room
+   * played at unity and a shot at 16 m was 1 dB down: there was no near field
+   * at all, and what a player heard in a firefight was every nearby shooter
+   * at the same level as the gun in their hands. Neither the world nor the
+   * genre does that — an SA80 measures 161 dB(C) at the shooter's ear and 128
+   * at 32 m, and the standing practice in this genre is a mix hierarchy that
+   * puts the player's own weapon on top of everything by design.
+   *
+   * `CONFIG.audio.rolloff` (0.7) is deliberately under the physical 1, for a
+   * reason the far field owns: 6 dB a doubling is right at the ear and
+   * useless as information, and this game's whole read on where a fight is
+   * comes through the far field. What makes the compromise cheap is that the
+   * reverb send is tapped PRE-panner (see `send`) and climbs with distance,
+   * so none of this touches the tail a distant shot is mostly made of.
+   *
+   * **`maxDistance` is not set on the node, because the inverse model does
+   * not use it.** It is a GATE the callers apply instead, and one consequence
+   * of the switch is that the callers whose own reach is longer than it — a
+   * blast gates at 1.6-2.2x — now actually sound out there. Under the linear
+   * model their nodes were built and then multiplied by exactly zero, so a
+   * grenade past 70 m was silent but for its tail.
+   */
+  private panner(bus: MixBus | null, at: Vector3): PannerNode | null {
+    if (!this.ctx || !bus) return null;
+    const a = CONFIG.audio;
+    if (this.voices >= a.maxVoices) return null;
+    const node = this.ctx.createPanner();
+    node.panningModel = "equalpower";
+    node.distanceModel = "inverse";
+    node.refDistance = a.refDistance;
+    node.rolloffFactor = a.rolloff;
+    node.positionX.value = at.x;
+    node.positionY.value = at.y;
+    node.positionZ.value = at.z;
+    node.connect(bus.dry);
+    return node;
+  }
+
+  /**
+   * freqMult: ending frequency as a multiple of the start (for slides).
+   * `extra` carries the three things only gunfire needs — a scheduling offset,
+   * a reverb send and the voice-cap exemption `shoot` argues for — so the
+   * eight plain call sites stay plain.
+   */
+  private tone(
+    bus: MixBus | null,
+    freq: number,
+    dur: number,
+    type: OscillatorType,
+    vol: number,
+    freqMult: number,
+    out?: AudioNode | null,
+    extra?: { delay?: number; send?: number; keep?: boolean },
+  ): void {
+    if (!this.ctx || !bus) return;
+    if (!extra?.keep && this.voices >= CONFIG.audio.maxVoices) return;
+    try {
+      const t0 = this.ctx.currentTime + (extra?.delay ?? 0);
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, t0);
+      osc.frequency.exponentialRampToValueAtTime(Math.max(20, freq * freqMult), t0 + dur);
+      gain.gain.setValueAtTime(vol, t0);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      osc.connect(gain).connect(out ?? bus.dry);
+      this.send(bus, gain, extra?.send);
+      this.voices += 1;
+      osc.onended = () => {
+        this.voices -= 1;
+      };
+      osc.start(t0);
+      osc.stop(t0 + dur + 0.02);
+    } catch {
+      // audio is non-critical; ignore failures
+    }
+  }
+
+  /**
+   * One layer of a percussive sound: a random slice of the shared noise buffer
+   * through an optional filter, with a two-stage decay.
+   *
+   * **The two stages are the point.** A single exponential from full to
+   * silence is a whoosh however short you make it; every impulsive sound in
+   * the physical world collapses most of the way in the first few percent of
+   * its length and then trails. That envelope, applied to filtered noise, is
+   * what the ear reads as "something struck", and it is doing more work here
+   * than any of the frequency choices above it.
+   *
+   * **`rise` is the escape hatch from exactly that**, and the only shape this
+   * helper makes that is not percussive — see the field.
+   */
+  private burst(bus: MixBus | null, b: {
+    dur: number;
+    vol: number;
+    /** Omitted leaves the slice unfiltered. */
+    type?: BiquadFilterType;
+    freq?: number;
+    /** Swept to, over the layer's duration. */
+    freqEnd?: number;
+    /**
+     * Seconds of SWELL in front of the two-stage decay, inside `dur` rather
+     * than in front of it — the layer still starts now, still ends at `dur`,
+     * and still sweeps its filter across the whole of it.
+     *
+     * **It is the one shape this helper could not make, and the one thing
+     * that reads as APPROACH.** The decay below is what says "something was
+     * struck"; a source coming towards the ear says the opposite, and no
+     * choice of frequency or duration substitutes for it. `nearMiss` is the
+     * only caller, and a second one should be something that ARRIVES.
+     */
+    rise?: number;
+    q?: number;
+    /** Seconds from now, on the audio clock — not a setTimeout. */
+    delay?: number;
+    out?: AudioNode | null;
+    /** Level into the shared environment reverb, pre-panner. */
+    send?: number;
+    /**
+     * Exempt from the voice cap — still counted, never refused. The player's
+     * own report and nothing else; see `shoot` for the bound that makes it
+     * safe.
+     */
+    keep?: boolean;
+  }): void {
+    if (!this.ctx || !bus || !this.noiseBuffer) return;
+    if (!b.keep && this.voices >= CONFIG.audio.maxVoices) return;
+    try {
+      const t0 = this.ctx.currentTime + (b.delay ?? 0);
+      const src = this.ctx.createBufferSource();
+      src.buffer = this.noiseBuffer;
+      const gain = this.ctx.createGain();
+      // The swell, when there is one. Clamped short of `dur` so the two
+      // stages below always have something to fall over — a `rise` at or past
+      // the whole length would put the second ramp at or before the first and
+      // leave the layer stuck at full gain until it stopped.
+      const rise = Math.min(b.rise ?? 0, b.dur * 0.8);
+      if (rise > 0) {
+        gain.gain.setValueAtTime(b.vol * 0.03, t0);
+        gain.gain.exponentialRampToValueAtTime(b.vol, t0 + rise);
+      } else {
+        gain.gain.setValueAtTime(b.vol, t0);
+      }
+      const decay = b.dur - rise;
+      gain.gain.exponentialRampToValueAtTime(b.vol * 0.18, t0 + rise + decay * 0.15);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + b.dur);
+      let head: AudioNode = src;
+      if (b.type && b.freq) {
+        const f = this.ctx.createBiquadFilter();
+        f.type = b.type;
+        f.Q.value = b.q ?? 1;
+        f.frequency.setValueAtTime(b.freq, t0);
+        if (b.freqEnd) {
+          f.frequency.exponentialRampToValueAtTime(b.freqEnd, t0 + b.dur);
+        }
+        src.connect(f);
+        head = f;
+      }
+      head.connect(gain).connect(b.out ?? bus.dry);
+      this.send(bus, gain, b.send);
+      this.voices += 1;
+      src.onended = () => {
+        this.voices -= 1;
+      };
+      // A different slice each time, so repeated shots don't phase together.
+      const offset = Math.random() * Math.max(0, this.noiseBuffer.duration - b.dur);
+      src.start(t0, offset, b.dur);
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * Taps a layer into the shared reverb. Tapped *before* the panner
+   * deliberately: reverberant energy is diffuse and arrives from every
+   * direction, so it is neither panned nor distance-attenuated — callers set
+   * the send level from distance themselves.
+   */
+  private send(
+    bus: MixBus | null,
+    from: GainNode,
+    level: number | undefined,
+  ): void {
+    if (!this.ctx || !this.reverb || !bus || !level) return;
+    const s = this.ctx.createGain();
+    s.gain.value = level;
+    from.connect(s).connect(bus.wet);
+  }
+
+  /**
+   * A piece of the weapon's mechanism. Bandpassed noise, because metal on
+   * metal is a resonance and a struck resonance is exactly what a filtered
+   * noise burst is — a square wave at the same pitch is a beep.
+   */
+  private clack(
+    bus: MixBus | null,
+    freq: number,
+    vol: number,
+    delay: number,
+    out?: AudioNode | null,
+  ): void {
+    // The bandpass throws away about half the noise's amplitude, so the raw
+    // gain sits above the level this ends up playing at — and the whole family
+    // sits far below a report, because a magazine catch is not a gunshot.
+    this.burst(bus, {
+      dur: 0.045, vol: 0.28 * vol, type: "bandpass", freq, q: 1.2,
+      delay, out, send: 0.2,
+    });
+  }
+}

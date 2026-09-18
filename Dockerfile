@@ -1,0 +1,150 @@
+# syntax=docker/dockerfile:1
+#
+# Dockerfile — the static game, and the match server it can be played against.
+#
+# TWO runtime targets out of one build stage:
+#
+#   web     nginx + dist/. The whole single-player game, and the client half of
+#           multiplayer. Carries no Node, no source and no node_modules.
+#   server  Node + dist-server/. The authoritative simulation: bots, flags,
+#           tickets and damage. See server/README.md.
+#
+# The game was static-only until multiplayer; single-player still is, and the
+# `web` target on its own remains a complete deployment of it.
+#
+#   docker build --target web    -t greywatch .
+#   docker build --target server -t greywatch-server .
+#   docker run --rm -p 8080:80 greywatch
+#
+# Or both together, wired up, with `docker compose up`.
+
+# ---------------------------------------------------------------------------
+# Build stage
+# ---------------------------------------------------------------------------
+FROM node:22-alpine AS build
+
+WORKDIR /app
+
+# Dependencies first, so an edit to src/ doesn't re-run the install layer.
+# `npm ci` (not `install`) so the build is pinned to package-lock.json.
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# Only what the build actually reads. models/ is deliberately absent: the
+# rigged GLB is unreferenced since the first-person conversion (see CLAUDE.md),
+# so it is neither typechecked against nor bundled, and copying 7 MB of it in
+# would only slow the build.
+COPY tsconfig.json vite.config.ts vite.server.config.ts index.html main.ts ./
+COPY src ./src
+COPY server ./server
+COPY scripts ./scripts
+# textures/, shots/ and audio/ are BUNDLED, not served: all three are imported
+# with Vite's `?url` (`WaterSystem`, `ui/mapShots.ts`, `core/samples.ts`), so
+# rollup resolves them out of the build context and a directory missing here
+# fails the bundle rather than the COPY — with an error that names the
+# importing module and not this file. Any future `?url` import from outside
+# src/ owes a line beside these three.
+COPY textures ./textures
+COPY shots ./shots
+# **audio/ is the future import that line predicted, and it arrived without
+# one** — the image build has been broken since the first sample shipped. It is
+# copied WHOLE, `src/` and all, because it is read TWICE: rollup takes the
+# fourteen encoded `.webm`s, and `check-audio.mjs` on the front of `npm run
+# build` hashes the committed MASTERS against the manifest to refuse a sound
+# whose generator was never re-run. That gate needs no ffmpeg precisely so it
+# can run on a clean checkout, which is what this stage is; copying only the
+# encoded output would leave it failing as "master missing". 2.8 MB, against
+# the 7 MB of unreferenced models/ deliberately left out above.
+#
+# It also fails EARLIER and more kindly than the comment above predicts: the
+# gate runs before the bundle and names `/app/audio/manifest.json`, which is a
+# path in this file rather than a module in src/.
+COPY audio ./audio
+# public/ is copied to dist/ verbatim: the web app manifest and the install
+# icons, which must keep the exact URLs the manifest and index.html name.
+COPY public ./public
+# **The PROSE is a build input now, and it is the second thing to arrive
+# without the line above it predicted.** `check-audio.mjs`'s CLAIMS table reads
+# `CLAUDE.md`, `docs/audio.md` and `docs/build.md` and matches every countable
+# fact in them against `audio/manifest.json` — a number quoted in a sentence
+# being one that was true once. So the gate on the front of `npm run build`
+# opens these files, and without them the image build dies on ENOENT before it
+# has typechecked a line. The whole of `docs/` rather than the two files that
+# have rows today: a new CLAIMS row must not be able to break this image, and
+# 1.3 MB is nothing beside the audio above it. **A gate that reads a file
+# outside `src/` owes a COPY here** — that is now three times.
+COPY CLAUDE.md ./
+COPY docs ./docs
+
+# `npm run build` checks the collision bake is current, typechecks BOTH
+# tsconfigs — via `npm run typecheck`, and that indirection is the whole point —
+# and then bundles. A type error fails the image build, and the bake check means
+# a layout edit that was never re-baked cannot ship a server whose walls stand
+# somewhere else from its clients'.
+#
+# **It said all of that before it was true, and the gap shipped.** `build` ran a
+# bare `tsc --noEmit`, which takes the ROOT tsconfig, whose `include` is
+# `["src", "main.ts"]` — so `server/` was never typechecked by anything the
+# image build ran. The line below could not catch it either: `build:server` is a
+# `vite build`, and esbuild strips types without reading them. Measured by
+# putting `const x: number = "s"` in `server/Roster.ts`: the server tsconfig
+# errored, the root one exited 0, and `build:server` emitted a bundle in 1.43s.
+# So a type error anywhere in `server/` passed both RUN lines and reached
+# production, which matters most for the client/server twins `Game.ts` and
+# `HeadlessGame.ts` deliberately keep in step by hand — a shared type that moved
+# on one side and not the other is exactly the failure this gate is for, and
+# exactly the one it could not see. Keep this as `npm run typecheck`; a `tsc
+# --noEmit` here is that hole reopening, and it reopens silently.
+RUN npm run build
+RUN npm run build:server
+
+# ---------------------------------------------------------------------------
+# Runtime stage: the match server
+# ---------------------------------------------------------------------------
+FROM node:22-alpine AS server
+
+WORKDIR /app
+
+# `ws` is the only runtime dependency — everything else, Babylon included, is
+# bundled into dist-server by the SSR build.
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+
+COPY --from=build /app/dist-server ./dist-server
+
+ENV PORT=8080
+EXPOSE 8080
+
+# Not root: this process listens on a socket and parses whatever arrives on it.
+USER node
+
+CMD ["node", "dist-server/index.js"]
+
+# ---------------------------------------------------------------------------
+# Runtime stage: the static game
+# ---------------------------------------------------------------------------
+FROM nginx:1.27-alpine AS web
+
+# A TEMPLATE under /etc/nginx/templates, not a conf under /etc/nginx/conf.d:
+# the image's entrypoint substitutes the environment into it and writes the
+# result to conf.d before nginx starts. That is what makes MATCH_SERVER a deploy
+# -time setting. The .envsh beside it publishes this container's own DNS servers
+# for the `resolver` the templated upstream needs; it is sourced, so it must be
+# executable, and the chmod is explicit rather than trusted to the checkout.
+COPY docker/default.conf.template /etc/nginx/templates/default.conf.template
+COPY docker/14-resolvers.envsh /docker-entrypoint.d/14-resolvers.envsh
+RUN chmod +x /docker-entrypoint.d/14-resolvers.envsh
+
+COPY --from=build /app/dist /usr/share/nginx/html
+
+# Where the match server is, as host:port. The default is the compose service
+# name, so `docker compose up` needs no configuration at all; a deployment that
+# runs the two containers some other way sets this to whatever it named the
+# server. Nothing is resolved until a request arrives on /ws or /matches, so a
+# wrong value here — or no server at all — costs those two paths and not the
+# game.
+ENV MATCH_SERVER=match-server:8080
+
+EXPOSE 80
+
+# nginx:alpine's own entrypoint/CMD already daemon-off's in the foreground.
