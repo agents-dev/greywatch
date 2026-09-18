@@ -13,3 +13,19 @@ plans/webgpu-ref/ref/
 # land in the repo root as a matter of course now — they are the instrument's
 # OUTPUT, never source.
 greywatch-*.json
+
+screenshots/
+
+*.log
+
+*.pid
+
+.agents/
+
+.agentsweb/
+
+.omgithub-runtime/
+
+.opencode-ssh/
+
+.opencode-web/
