@@ -1,7 +1,10 @@
 /**
  * NavGrid.ts — Walkable-surface graph + one precomputed flow field per
- * objective (5 flags + 2 home spawns). Built ONCE at map load from the final
- * collider set; runtime is read-only (bots call steer(), never pathfind).
+ * objective (5 flags + 2 home spawns) + one on-demand A* (`findPath`) for the
+ * destinations no field routes to. Built ONCE at map load from the final
+ * collider set; runtime is read-only except for `openBox`'s monotonic gain
+ * and `findPath`'s own reusable scratch (bots call steer(), or follow a path
+ * this file searched for them, and never walk anything else).
  * Invariants: a graph node is a (cell, height) SURFACE — one cell can hold
  * creek floor + bridge deck (maxSurfaces, 3 unless the map raises it), and its
  * id is the COMPACTED `cellBase[cell] + slot` rather than the stride form, so
@@ -86,6 +89,8 @@ const NEIGHBOURS: [number, number][] = [
 ];
 /** Index of the NEIGHBOURS entry pointing the other way. Keep in step. */
 const OPPOSITE = [1, 0, 3, 2, 7, 6, 5, 4];
+/** Cost of a diagonal step, and the matching term in the octile heuristic. */
+const DIAG = Math.SQRT2;
 
 /** An inclusive rectangle of cells. Grid coordinates, never world ones. */
 interface CellRect {
@@ -1026,5 +1031,221 @@ export class NavGrid {
   reachable(field: FlowField, pos: Vector3): boolean {
     const s = this.surfaceAt(pos.x, pos.y, pos.z);
     return s >= 0 && field.dist[s] !== FLOW_UNREACHED;
+  }
+
+  /**
+   * On-demand A* between two world points, over the same surfaces and links
+   * the flow fields are swept from. The fields route to seven fixed goals; a
+   * remembered gunshot, a cover anchor and a vantage are none of those, and
+   * steering straight at one is what walked bots into walls for the rest of
+   * the round. This is the route for those three, and for nothing else —
+   * anything with a field keeps its field, which sixteen bots share instead
+   * of searching each.
+   *
+   * Writes up to `CONFIG.nav.path.maxWaypoints` cell centres into
+   * `outX`/`outZ` — every link but the last, then the destination itself, so
+   * arrival is on the point asked for rather than on a cell centre — and
+   * returns how many. 0 means no route (or none worth the search): the caller
+   * steers direct, which is the old behaviour exactly.
+   *
+   * Allocation-free at the call site: the search runs on per-grid scratch
+   * (`pathGen`/`pathG`/`pathFrom`/the heap) allocated once at `surfaceCount`
+   * and reused, stamped by generation so no call pays to clear it. The one
+   * thing a break can do to a route searched before it is IMPROVE it —
+   * `openBox` only ever gains links — so a path never goes stale, it only
+   * ever stops being the shortest.
+   *
+   * Deterministic: fixed neighbour order, ties keeping the lower score, no
+   * randomness anywhere — the authority and a client search the same graph
+   * and walk the same line.
+   */
+  findPath(
+    fromX: number,
+    fromY: number,
+    fromZ: number,
+    toX: number,
+    toY: number,
+    toZ: number,
+    outX: Float32Array,
+    outZ: Float32Array,
+  ): number {
+    const cfg = CONFIG.nav.path;
+    const start = this.surfaceAt(fromX, fromY, fromZ);
+    const goal = this.surfaceAt(toX, toY, toZ);
+    if (start < 0 || goal < 0) return 0;
+    if (start === goal) {
+      if (cfg.maxWaypoints < 1) return 0;
+      outX[0] = toX;
+      outZ[0] = toZ;
+      return 1;
+    }
+    this.ensurePathScratch();
+    const linkStride = NEIGHBOURS.length;
+    const dim = this.dim;
+    const goalCell = this.surfaceCell[goal];
+    const goalCx = goalCell % dim;
+    const goalCz = (goalCell - goalCx) / dim;
+
+    // Octile distance in cells: admissible, since a step costs 1 cardinal
+    // and DIAG diagonal and this is the cheapest any route can be.
+    const heuristic = (surface: number): number => {
+      const cell = this.surfaceCell[surface];
+      const cx = cell % dim;
+      const cz = (cell - cx) / dim;
+      const dx = Math.abs(cx - goalCx);
+      const dz = Math.abs(cz - goalCz);
+      const m = Math.min(dx, dz);
+      return Math.max(dx, dz) + (DIAG - 1) * m;
+    };
+
+    this.pathGenStamp++;
+    // A stamp per surface rather than a fill per search: clearing three
+    // surface-sized arrays on every think tick is what this avoids. The
+    // counter cannot wrap in a round anyone will play; the guard is for the
+    // process that runs longer than 2^31 searches.
+    if (this.pathGenStamp >= 0x7fffffff) {
+      this.pathGen.fill(0);
+      this.pathGenStamp = 1;
+    }
+    const stamp = this.pathGenStamp;
+    const { pathGen, pathClosed, pathG, pathFrom, pathHeap, pathHeapF } = this;
+    pathGen[start] = stamp;
+    pathG[start] = 0;
+    pathFrom[start] = -1;
+    let heapSize = 0;
+    let heapFull = false;
+    const push = (surface: number, f: number): void => {
+      // Every push strictly improves a surface's score, so this cannot fill
+      // in practice — but a write past the heap would throw inside a think
+      // tick, where falling back to direct steering is strictly better.
+      if (heapSize >= pathHeap.length) {
+        heapFull = true;
+        return;
+      }
+      let i = heapSize++;
+      pathHeap[i] = surface;
+      pathHeapF[i] = f;
+      while (i > 0) {
+        const parent = (i - 1) >> 1;
+        if (pathHeapF[parent] <= pathHeapF[i]) break;
+        const ts = pathHeap[parent];
+        pathHeap[parent] = pathHeap[i];
+        pathHeap[i] = ts;
+        const tf = pathHeapF[parent];
+        pathHeapF[parent] = pathHeapF[i];
+        pathHeapF[i] = tf;
+        i = parent;
+      }
+    };
+    const pop = (): number => {
+      const top = pathHeap[0];
+      heapSize--;
+      if (heapSize > 0) {
+        pathHeap[0] = pathHeap[heapSize];
+        pathHeapF[0] = pathHeapF[heapSize];
+        let i = 0;
+        for (;;) {
+          const left = i * 2 + 1;
+          if (left >= heapSize) break;
+          const right = left + 1;
+          let child = left;
+          if (right < heapSize && pathHeapF[right] < pathHeapF[left]) {
+            child = right;
+          }
+          if (pathHeapF[i] <= pathHeapF[child]) break;
+          const ts = pathHeap[child];
+          pathHeap[child] = pathHeap[i];
+          pathHeap[i] = ts;
+          const tf = pathHeapF[child];
+          pathHeapF[child] = pathHeapF[i];
+          pathHeapF[i] = tf;
+          i = child;
+        }
+      }
+      return top;
+    };
+    push(start, heuristic(start));
+
+    let expansions = 0;
+    let found = false;
+    while (heapSize > 0) {
+      if (heapFull || expansions >= cfg.maxExpansions) return 0;
+      const surface = pop();
+      // Re-pushed with a better score after this entry was queued: the entry
+      // is stale and the fresher one is still in the heap.
+      if (pathClosed[surface] === stamp) continue;
+      pathClosed[surface] = stamp;
+      if (surface === goal) {
+        found = true;
+        break;
+      }
+      expansions++;
+      const sCell = this.surfaceCell[surface];
+      const sCx = sCell % dim;
+      const sCz = (sCell - sCx) / dim;
+      const base = surface * linkStride;
+      for (let n = 0; n < linkStride; n++) {
+        const t = this.links[base + n];
+        // The same traversability every flow field is swept over: a link to
+        // a walkable surface. Anything else is ground the goal's own field
+        // could not route either.
+        if (t < 0 || !this.walkable[t] || pathClosed[t] === stamp) continue;
+        const tCell = this.surfaceCell[t];
+        const tCx = tCell % dim;
+        const tCz = (tCell - tCx) / dim;
+        const dx = Math.abs(tCx - sCx);
+        const dz = Math.abs(tCz - sCz);
+        const ng = pathG[surface] + (dx !== 0 && dz !== 0 ? DIAG : 1);
+        if (pathGen[t] === stamp && ng >= pathG[t]) continue;
+        pathGen[t] = stamp;
+        pathG[t] = ng;
+        pathFrom[t] = surface;
+        push(t, ng + heuristic(t));
+      }
+    }
+    if (!found) return 0;
+
+    // Walk the chain back to count it: a route longer than the caller can
+    // hold is refused rather than truncated, since a path that stops short
+    // of its goal strands the bot it was searched for.
+    let length = 0;
+    for (let s = goal; s !== -1; s = pathFrom[s]) length++;
+    // `length` counts surfaces including the start; waypoints exclude it.
+    if (length - 1 > cfg.maxWaypoints || length - 1 > outX.length || length - 1 > outZ.length) {
+      return 0;
+    }
+    let i = length - 2;
+    for (let s = goal; s !== start; s = pathFrom[s]) {
+      const cell = this.surfaceCell[s];
+      const cx = cell % dim;
+      outX[i] = this.toWorld(cx);
+      outZ[i] = this.toWorld((cell - cx) / dim);
+      i--;
+    }
+    // Arrival is on the point asked for, not on the goal cell's centre.
+    outX[length - 2] = toX;
+    outZ[length - 2] = toZ;
+    return length - 1;
+  }
+
+  /** `findPath`'s reusable scratch, sized to the graph on first search. */
+  private pathGen = new Int32Array(0);
+  private pathClosed = new Int32Array(0);
+  private pathG = new Float32Array(0);
+  private pathFrom = new Int32Array(0);
+  private pathHeap = new Int32Array(0);
+  private pathHeapF = new Float32Array(0);
+  private pathGenStamp = 0;
+
+  private ensurePathScratch(): void {
+    if (this.pathGen.length === this.surfaceCount) return;
+    const n = this.surfaceCount;
+    this.pathGen = new Int32Array(n);
+    this.pathClosed = new Int32Array(n);
+    this.pathG = new Float32Array(n);
+    this.pathFrom = new Int32Array(n);
+    this.pathHeap = new Int32Array(n + 1);
+    this.pathHeapF = new Float32Array(n + 1);
+    this.pathGenStamp = 0;
   }
 }

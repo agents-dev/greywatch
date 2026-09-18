@@ -1075,6 +1075,45 @@ export const nav = {
   /** Max step-up a bot can walk over without a ramp. */
   stepHeight: 0.6,
   /**
+   * On-demand point-to-point search (`NavGrid.findPath`): the route to a
+   * remembered gunshot, a cover anchor or a vantage — the destinations no
+   * flow field routes to, which bots used to walk at in a straight line.
+   *
+   * Searched on the think tick, never per frame, and followed a waypoint at
+   * a time; anything with a field keeps its field. All four numbers bound
+   * the search rather than tuning the walk, so loosening them costs think
+   * time and tightening them only falls back to direct steering sooner.
+   */
+  path: {
+    /**
+     * Waypoints a route may hold. 64 cells at 1.5 m is ~96 m of route, past
+     * which the destination (a gunshot inside hearing, a corner inside
+     * `cover.searchRadius`) was never going to be. Longer chains are
+     * refused, not truncated — a path that stops short strands its bot.
+     */
+    maxWaypoints: 64,
+    /**
+     * Surfaces an A* may pop before giving up. A hunt inside `engageRange`
+     * settles in the low hundreds; this is an order of magnitude past that,
+     * so hitting it means the goal is across the map or sealed off, and
+     * either way direct steering plus the stuck watchdog is the honest
+     * answer.
+     */
+    maxExpansions: 4096,
+    /**
+     * How far the destination may move before the route is searched again,
+     * in metres. A remembered gunshot does not move at all and a cover spot
+     * is latched, so repaths are rare by construction rather than by rate
+     * limit — this is the drift that covers the cases that do move.
+     */
+    repathDistance: 2,
+    /**
+     * Close enough to a waypoint to take the next one, in metres. Under a
+     * cell, so a bot cuts the corner through it rather than turning on it.
+     */
+    arriveRadius: 1.0,
+  },
+  /**
    * Standable surfaces `NavGrid` tracks per cell, where a map does not say
    * otherwise (`MapLayout.surfaces`).
    *

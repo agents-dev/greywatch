@@ -135,8 +135,17 @@ the terrain simply wins the surface and it costs nothing. `buildBarn`'s `rampDro
 is the worked example.
 
 One flow field per objective (5 flags + 2 home spawns) is precomputed at load; the
-map is static so nothing is ever recomputed. Bots read `nav.steer()` and never run
-their own pathfinding. **A field is a `Uint16Array` of BFS STEP COUNTS over the
+ map is static so nothing is ever recomputed. Bots read `nav.steer()` to their
+objective; to a POINT destination — a hunt's last-known position, a cover
+anchor, a held vantage, none of which is an objective — they walk an on-demand
+A* (`NavGrid.findPath`, `CONFIG.nav.path`) searched on the think tick and
+followed a waypoint at a time, blended two ahead exactly as `steerAhead`
+blends. Anything with a field keeps its field, which the roster shares instead
+of searching each; the search refuses (sealed goal, a spent budget) rather
+than truncating, and the refusal falls back to the old direct steering with
+the stuck watchdog underneath. It is deterministic and allocation-free at the
+call site, and a glass break can only ever improve a route searched before it,
+so paths never go stale. **A field is a `Uint16Array` of BFS STEP COUNTS over the
 graph's surface ids, never a distance and never a float** — `FLOW_UNREACHED` is
 the top of the type and stands for ground the goal cannot reach, so it loses
 every `<` a steer makes exactly as `Infinity` used to. Seven of them over a

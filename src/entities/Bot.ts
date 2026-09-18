@@ -2,8 +2,10 @@
  * Bot.ts — AI combatant: FSM (advance/hunt/engage/takeCover/suppressed/retreat/
  * capture/dead), movement, perception, aiming, firing. Rig visuals come from
  * SoldierModel.
- * Invariants: NEVER uses moveWithCollisions and never runs its own pathfinding —
- * movement steers on NavGrid flow fields + ObstacleField push-out. The graph
+ * Invariants: NEVER uses moveWithCollisions and never steers blind — movement
+ * follows NavGrid flow fields to objectives, an on-demand A* route
+ * (`refreshPath`/`followPath`) to point destinations a field cannot name, and
+ * ObstacleField push-out under both. The graph
  * picks the SURFACE and the geometry places the FEET (`settle`): a surface is
  * sampled per cell CENTRE, so writing its height straight into `position.y` is
  * what made bots climb a slope as a flight of stairs, and everything hanging
@@ -374,6 +376,21 @@ export class Bot implements Combatant {
   private readonly coverSpot = new Vector3();
   private hasCoverSpot = false;
   /**
+   * On-demand route to a point destination — a hunt's last-known position, a
+   * cover anchor, a held vantage — the places no flow field routes to.
+   * Searched on the think tick (`refreshPath`), followed a waypoint at a
+   * time (`followPath`), and dropped the moment the destination is gone: it
+   * is a cache of a decision, never state of its own. Empty (`pathLen` 0)
+   * means steer direct, which is the old behaviour exactly.
+   */
+  private readonly pathX = new Float32Array(CONFIG.nav.path.maxWaypoints);
+  private readonly pathZ = new Float32Array(CONFIG.nav.path.maxWaypoints);
+  private pathLen = 0;
+  private pathIdx = 0;
+  /** What destination the route above was searched for. */
+  private readonly pathGoal = new Vector3();
+  private pathGoalSet = false;
+  /**
    * What that spot is: cover to stand behind, or cover to duck behind.
    *
    * Re-read against the CURRENT bearing on every think while the bot is at the
@@ -594,6 +611,11 @@ export class Bot implements Combatant {
     this.detourT = 0;
     this.stuckStreak = 0;
     this.squeezeT = 0;
+    // A new life starts with no route: the old one belonged to a body that
+    // died somewhere else, and the first think searches a fresh one.
+    this.pathLen = 0;
+    this.pathIdx = 0;
+    this.pathGoalSet = false;
     this.syncTransform();
     // Re-pose to idle. The pooled rig may still hold whatever the last life
     // ended in — the pose a corpse settled in, or the stride it was refused a
@@ -632,6 +654,12 @@ export class Bot implements Combatant {
    */
   nudgeTo(at: Vector3): void {
     this.position.copyFrom(at);
+    // Carried, not walked: a route searched from where the body stood means
+    // nothing about where it was put down, so it goes and the next think
+    // searches the walk that is actually left.
+    this.pathLen = 0;
+    this.pathIdx = 0;
+    this.pathGoalSet = false;
     this.syncTransform();
   }
 
@@ -793,10 +821,15 @@ export class Bot implements Combatant {
             }
           }
           if (this.hasCoverSpot && !this.atCoverSpot()) {
-            _to.copyFrom(this.coverSpot).subtractInPlace(this.position);
-            _to.y = 0;
-            const away = _to.length();
-            if (away > 1e-3) _dir.copyFrom(_to).scaleInPlace(1 / away);
+            // The same on-demand route `takeCover` walks: a vantage across
+            // the street is still a walk round the wall between, not through
+            // it.
+            if (!this.followPath(_dir)) {
+              _to.copyFrom(this.coverSpot).subtractInPlace(this.position);
+              _to.y = 0;
+              const away = _to.length();
+              if (away > 1e-3) _dir.copyFrom(_to).scaleInPlace(1 / away);
+            }
             speed *= 0.8;
           } else if (this.hasCoverSpot && this.alerted) {
             // Arrived, with something to watch for: get down behind it. A
@@ -818,15 +851,19 @@ export class Bot implements Combatant {
         // bot straight back to walking at its flag, which is what made them
         // feel oblivious.
         //
-        // Steered directly rather than on a flow field — fields only route to
-        // objectives, and a remembered position is not one. `tryMove`'s axis
-        // sliding and the stuck watchdog are exactly what that case needs, and
-        // they are already here.
+        // Walked along the on-demand route, not straight at it — fields only
+        // route to objectives and a remembered position is not one, so
+        // steering direct here is what ground bots into walls. When the
+        // search refuses (sealed goal, a budget spent) the fallback IS direct
+        // steering with `tryMove`'s axis sliding and the stuck watchdog,
+        // which are still here underneath.
         _to.copyFrom(this.memory.lastKnown).subtractInPlace(this.position);
         _to.y = 0;
         const away = _to.length();
         if (away > CONFIG.bots.perception.huntArriveRadius && this.sweepT <= 0) {
-          _dir.copyFrom(_to).scaleInPlace(1 / away);
+          if (!this.followPath(_dir)) {
+            _dir.copyFrom(_to).scaleInPlace(1 / away);
+          }
         } else {
           // Arrived. Stand and look around rather than walking in circles.
           if (this.sweepT <= 0) this.sweepT = CONFIG.bots.perception.huntSweepTime;
@@ -908,14 +945,18 @@ export class Bot implements Combatant {
         break;
       }
       case "takeCover": {
-        // Move to the latched spot, holding fire on the way. Steered directly:
-        // it is a handful of metres, and `tryMove`'s axis sliding plus the
-        // stuck watchdog are exactly the tools for short awkward hops.
+        // Move to the latched spot, holding fire on the way. Walked along
+        // the on-demand route: even a handful of metres crosses a wall in a
+        // city, and direct steering plus the stuck watchdog was the whole of
+        // what the old code had for that. The fallback is still underneath
+        // when the search refuses.
         if (this.hasCoverSpot) {
-          _to.copyFrom(this.coverSpot).subtractInPlace(this.position);
-          _to.y = 0;
-          const away = _to.length();
-          if (away > 1e-3) _dir.copyFrom(_to).scaleInPlace(1 / away);
+          if (!this.followPath(_dir)) {
+            _to.copyFrom(this.coverSpot).subtractInPlace(this.position);
+            _to.y = 0;
+            const away = _to.length();
+            if (away > 1e-3) _dir.copyFrom(_to).scaleInPlace(1 / away);
+          }
         }
         break;
       }
@@ -1599,6 +1640,11 @@ export class Bot implements Combatant {
         this.peekT = this.profile.peekOutTime;
       }
     }
+
+    // The route to wherever this state walks, searched at think rate. States
+    // with no point destination drop the one they had; one whose goal moved
+    // on gets a fresh search, and the rest keep walking what they have.
+    this.refreshPath(ctx);
   }
 
   /**
@@ -1695,13 +1741,127 @@ export class Bot implements Combatant {
   }
 
   /**
+   * The point destination the current state wants to walk to, if it has one:
+   * a hunt's last-known position, a cover anchor on the way in, a held
+   * vantage. False for the field-driven states and the close-quarters ones,
+   * which keep steering the way they always did.
+   */
+  private pathDestination(into: Vector3): boolean {
+    if (this.state === "hunt") {
+      if (this.memory.lastKnownT <= 0) return false;
+      into.copyFrom(this.memory.lastKnown);
+      return true;
+    }
+    if (
+      (this.state === "takeCover" || this.state === "capture") &&
+      this.hasCoverSpot
+    ) {
+      into.copyFrom(this.coverSpot);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * (Re)searches the on-demand route when the destination has moved on.
+   * Called on the think tick, never per frame: a remembered gunshot does not
+   * move and a cover spot is latched, so repaths are rare by construction
+   * rather than by rate limit, and a search refused (sealed goal, a budget
+   * spent) simply leaves the direct-steering fallback in charge.
+   */
+  private refreshPath(ctx: BattleCtx): void {
+    if (!this.pathDestination(_to)) {
+      this.pathLen = 0;
+      this.pathGoalSet = false;
+      return;
+    }
+    const p = CONFIG.nav.path;
+    if (this.pathGoalSet && this.pathIdx < this.pathLen) {
+      const moved = Math.hypot(
+        _to.x - this.pathGoal.x,
+        _to.z - this.pathGoal.z,
+      );
+      if (moved < p.repathDistance) return;
+    }
+    const n = ctx.nav.findPath(
+      this.position.x,
+      this.position.y,
+      this.position.z,
+      _to.x,
+      _to.y,
+      _to.z,
+      this.pathX,
+      this.pathZ,
+    );
+    if (n > 0) {
+      this.pathLen = n;
+      this.pathIdx = 0;
+      this.pathGoal.copyFrom(_to);
+      this.pathGoalSet = true;
+    } else {
+      this.pathLen = 0;
+      this.pathGoalSet = false;
+    }
+  }
+
+  /**
+   * Steers along the on-demand route, a waypoint at a time. False when there
+   * is no route left — none searched, or walked to the end of — so the caller
+   * steers direct at its goal, which is the old behaviour exactly.
+   *
+   * The aim is the current waypoint blended with the one after it:
+   * `steerAhead`'s trick without a field. Raw cell centres are a 1.5 m
+   * zigzag, and steering at one at a time walks it; the blend cuts the
+   * corner without ever aiming hard through the wall the route bends round,
+   * and needs no line-of-sight test to do it.
+   */
+  private followPath(into: Vector3): boolean {
+    const p = CONFIG.nav.path;
+    if (this.pathIdx >= this.pathLen) return false;
+    // Skip what walking has already passed: a repath mid-route can leave a
+    // waypoint behind the bot, and steering at it would turn it round.
+    const arrive2 = p.arriveRadius * p.arriveRadius;
+    while (this.pathIdx < this.pathLen) {
+      const dx = this.pathX[this.pathIdx] - this.position.x;
+      const dz = this.pathZ[this.pathIdx] - this.position.z;
+      if (dx * dx + dz * dz > arrive2) break;
+      this.pathIdx++;
+    }
+    if (this.pathIdx >= this.pathLen) return false;
+    let dx = this.pathX[this.pathIdx] - this.position.x;
+    let dz = this.pathZ[this.pathIdx] - this.position.z;
+    let len = Math.hypot(dx, dz);
+    if (len < 1e-4) return false;
+    dx /= len;
+    dz /= len;
+    const next = this.pathIdx + 1;
+    if (next < this.pathLen) {
+      let nx = this.pathX[next] - this.position.x;
+      let nz = this.pathZ[next] - this.position.z;
+      const nl = Math.hypot(nx, nz);
+      if (nl > 1e-4) {
+        dx += nx / nl;
+        dz += nz / nl;
+        len = Math.hypot(dx, dz);
+        if (len < 1e-4) return false;
+        dx /= len;
+        dz /= len;
+      }
+    }
+    into.set(dx, 0, dz);
+    return true;
+  }
+
+  /**
    * Turns the flow field's raw output into something a body could plausibly
    * walk, in place: smooths it, weaves it, hugs walls with it, and notices when
    * the route has just turned a corner.
    *
-   * Only the flow-field states use this. The close-quarters states (`hunt`
-   * arrival, `takeCover`, the peek cycle) steer at a specific point a few metres
-   * away, where smoothing would only add lag and blur the peek.
+   * Only the flow-field states use this. The path states (`hunt`,
+   * `takeCover`, a held vantage) blend two waypoints instead, where temporal
+   * smoothing would only add lag; the close-quarters leftovers (a hunt
+   * arrived, the peek cycle) steer at a specific point a few metres away,
+   * where it would blur the decision.
    *
    * It runs *before* separation and the stuck watchdog on purpose: the
    * watchdog's sidestep is what gets a wedged bot out from behind a tree, and
